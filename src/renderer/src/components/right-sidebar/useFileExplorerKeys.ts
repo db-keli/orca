@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { useAppStore } from '@/store'
 import type { InlineInput } from './FileExplorerRow'
 import type { TreeNode } from './file-explorer-types'
+import { formatFileExplorerPathsForClipboard } from './file-explorer-selection'
 import {
   fileExplorerHasRedo,
   fileExplorerHasUndo,
@@ -44,6 +45,7 @@ export function useFileExplorerKeys(opts: {
   containerRef: React.RefObject<HTMLDivElement | null>
   flatRows: TreeNode[]
   inlineInput: InlineInput | null
+  selectedPaths: Set<string>
   selectedNode: TreeNode | null
   startRename: (node: TreeNode) => void
   requestDelete: (node: TreeNode) => void
@@ -55,6 +57,8 @@ export function useFileExplorerKeys(opts: {
   flatRowsRef.current = opts.flatRows
   const inlineInputRef = useRef(opts.inlineInput)
   inlineInputRef.current = opts.inlineInput
+  const selectedPathsRef = useRef(opts.selectedPaths)
+  selectedPathsRef.current = opts.selectedPaths
   const selectedNodeRef = useRef(opts.selectedNode)
   selectedNodeRef.current = opts.selectedNode
   const startRenameRef = useRef(opts.startRename)
@@ -144,14 +148,20 @@ export function useFileExplorerKeys(opts: {
       if (!focusInExplorer()) {
         return
       }
-      const node = selectedNodeRef.current
-      if (!node) {
+      const node = selectedNodeRef.current ?? findFocusedNode()
+      const selectedNodes = flatRowsRef.current.filter((row) =>
+        selectedPathsRef.current.has(row.path)
+      )
+      const fallbackNodes = selectedNodes.length > 0 ? selectedNodes : node ? [node] : []
+      if (fallbackNodes.length === 0) {
         return
       }
       // ⌥⇧⌘C (Mac) / Ctrl+Shift+Alt+C (Win) — Copy Relative Path
       if (e.code === 'KeyC' && e.altKey && e.shiftKey && (isMac ? e.metaKey : e.ctrlKey)) {
         e.preventDefault()
-        window.api.ui.writeClipboardText(node.relativePath)
+        window.api.ui.writeClipboardText(
+          formatFileExplorerPathsForClipboard(fallbackNodes, 'relative')
+        )
         return
       }
       // ⌥⌘C (Mac) / Shift+Alt+C (Win) — Copy Path
@@ -161,7 +171,9 @@ export function useFileExplorerKeys(opts: {
         ((isMac && e.metaKey && !e.shiftKey) || (!isMac && e.shiftKey && !e.ctrlKey))
       ) {
         e.preventDefault()
-        window.api.ui.writeClipboardText(node.path)
+        window.api.ui.writeClipboardText(
+          formatFileExplorerPathsForClipboard(fallbackNodes, 'absolute')
+        )
       }
     }
 

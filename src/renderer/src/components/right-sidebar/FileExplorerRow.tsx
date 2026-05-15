@@ -200,9 +200,11 @@ type FileExplorerRowProps = {
   deleteShortcutLabel: string
   targetDir: string
   targetDepth: number
-  onClick: () => void
+  selectionSize: number
+  onClick: (event: React.MouseEvent<HTMLButtonElement>) => void
   onDoubleClick: () => void
-  onSelect: () => void
+  onContextMenuSelect: () => void
+  onCopyPaths: (pathKind: 'absolute' | 'relative') => void
   onStartNew: (type: 'file' | 'folder', dir: string, depth: number) => void
   onStartRename: (node: TreeNode) => void
   onDuplicate: (node: TreeNode) => void
@@ -226,9 +228,11 @@ export function FileExplorerRow({
   deleteShortcutLabel,
   targetDir,
   targetDepth,
+  selectionSize,
   onClick,
   onDoubleClick,
-  onSelect,
+  onContextMenuSelect,
+  onCopyPaths,
   onStartNew,
   onStartRename,
   onDuplicate,
@@ -280,8 +284,7 @@ export function FileExplorerRow({
           onDrop={handleDrop}
           onClick={onClick}
           onDoubleClick={onDoubleClick}
-          onFocus={onSelect}
-          onContextMenu={onSelect}
+          onContextMenu={onContextMenuSelect}
         >
           {node.isDirectory ? (
             <>
@@ -342,14 +345,14 @@ export function FileExplorerRow({
           New Folder
         </ContextMenuItem>
         <ContextMenuSeparator />
-        <ContextMenuItem onSelect={() => window.api.ui.writeClipboardText(node.path)}>
+        <ContextMenuItem onSelect={() => onCopyPaths('absolute')}>
           <Copy />
-          Copy Path
+          {selectionSize > 1 ? 'Copy Paths' : 'Copy Path'}
           <ContextMenuShortcut>{isMac ? '⌥⌘C' : 'Shift+Alt+C'}</ContextMenuShortcut>
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => window.api.ui.writeClipboardText(node.relativePath)}>
+        <ContextMenuItem onSelect={() => onCopyPaths('relative')}>
           <Copy />
-          Copy Relative Path
+          {selectionSize > 1 ? 'Copy Relative Paths' : 'Copy Relative Path'}
           <ContextMenuShortcut>{isMac ? '⌥⇧⌘C' : 'Ctrl+Shift+Alt+C'}</ContextMenuShortcut>
         </ContextMenuItem>
         {!node.isDirectory && (
