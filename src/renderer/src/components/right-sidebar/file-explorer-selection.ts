@@ -133,6 +133,10 @@ export function countVisibleFileExplorerSelections(
   flatRows: readonly TreeNode[],
   selectedPaths: Set<string>
 ): number {
+  if (selectedPaths.size <= 1) {
+    return selectedPaths.size
+  }
+
   return flatRows.reduce((count, node) => count + (selectedPaths.has(node.path) ? 1 : 0), 0)
 }
 

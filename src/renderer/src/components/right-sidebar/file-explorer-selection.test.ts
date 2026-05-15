@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { TreeNode } from './file-explorer-types'
 import {
+  countVisibleFileExplorerSelections,
   createSingleFileExplorerSelection,
   formatFileExplorerPathsForClipboard,
   getFileExplorerActionNodes,
@@ -90,5 +91,19 @@ describe('file explorer selection', () => {
     const actionNodes = getFileExplorerActionNodes(rows, new Set(['/repo/a.ts']), rows[1])
 
     expect(actionNodes.map((entry) => entry.path)).toEqual(['/repo/b.ts'])
+  })
+
+  it('does not scan rows for empty or single selection counts', () => {
+    const rows = new Proxy([node('/repo/a.ts')], {
+      get(target, prop, receiver) {
+        if (prop === 'reduce') {
+          throw new Error('unexpected row scan')
+        }
+        return Reflect.get(target, prop, receiver)
+      }
+    })
+
+    expect(countVisibleFileExplorerSelections(rows, new Set())).toBe(0)
+    expect(countVisibleFileExplorerSelections(rows, new Set(['/repo/a.ts']))).toBe(1)
   })
 })

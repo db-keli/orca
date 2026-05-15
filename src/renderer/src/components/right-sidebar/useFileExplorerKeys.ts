@@ -35,6 +35,18 @@ function isCmdZUndo(e: KeyboardEvent): boolean {
   return e.code === 'KeyZ' || e.key.toLowerCase() === 'z'
 }
 
+function isCopyRelativePathShortcut(e: KeyboardEvent): boolean {
+  return e.code === 'KeyC' && e.altKey && e.shiftKey && (isMac ? e.metaKey : e.ctrlKey)
+}
+
+function isCopyPathShortcut(e: KeyboardEvent): boolean {
+  return (
+    e.code === 'KeyC' &&
+    e.altKey &&
+    ((isMac && e.metaKey && !e.shiftKey) || (!isMac && e.shiftKey && !e.ctrlKey))
+  )
+}
+
 /**
  * Keyboard shortcuts for the file explorer.
  *
@@ -148,6 +160,12 @@ export function useFileExplorerKeys(opts: {
       if (!focusInExplorer()) {
         return
       }
+      const wantsCopyRelativePath = isCopyRelativePathShortcut(e)
+      const wantsCopyPath = isCopyPathShortcut(e)
+      if (!wantsCopyRelativePath && !wantsCopyPath) {
+        return
+      }
+
       const node = selectedNodeRef.current ?? findFocusedNode()
       const selectedNodes = flatRowsRef.current.filter((row) =>
         selectedPathsRef.current.has(row.path)
@@ -157,7 +175,7 @@ export function useFileExplorerKeys(opts: {
         return
       }
       // ⌥⇧⌘C (Mac) / Ctrl+Shift+Alt+C (Win) — Copy Relative Path
-      if (e.code === 'KeyC' && e.altKey && e.shiftKey && (isMac ? e.metaKey : e.ctrlKey)) {
+      if (wantsCopyRelativePath) {
         e.preventDefault()
         window.api.ui.writeClipboardText(
           formatFileExplorerPathsForClipboard(fallbackNodes, 'relative')
@@ -165,11 +183,7 @@ export function useFileExplorerKeys(opts: {
         return
       }
       // ⌥⌘C (Mac) / Shift+Alt+C (Win) — Copy Path
-      if (
-        e.code === 'KeyC' &&
-        e.altKey &&
-        ((isMac && e.metaKey && !e.shiftKey) || (!isMac && e.shiftKey && !e.ctrlKey))
-      ) {
+      if (wantsCopyPath) {
         e.preventDefault()
         window.api.ui.writeClipboardText(
           formatFileExplorerPathsForClipboard(fallbackNodes, 'absolute')
