@@ -1,16 +1,26 @@
+/* eslint-disable max-lines */
 import type { StateCreator } from 'zustand'
 import type { AppState } from '../types'
 import type { GlobalSettings } from '../../../../shared/types'
 import { toast } from 'sonner'
-import { callRuntimeRpc, clearRuntimeCompatibilityCache } from '@/runtime/runtime-rpc-client'
+import {
+  callRuntimeRpc,
+  clearRuntimeCompatibilityCache,
+  markRuntimeEnvironmentCompatible,
+  unwrapRuntimeRpcResult
+} from '@/runtime/runtime-rpc-client'
+import { assertRuntimeStatusCompatible } from '@/runtime/runtime-protocol-compat'
+import { toRuntimeWorktreeSelector } from '@/runtime/runtime-worktree-selector'
 import {
   getRemoteRuntimePtyEnvironmentId,
   getRemoteRuntimeTerminalHandle
 } from '@/runtime/runtime-terminal-stream'
+import type { RuntimeStatus } from '../../../../shared/runtime-types'
 import { normalizeTerminalQuickCommands } from '../../../../shared/terminal-quick-commands'
-import { normalizeVisibleTaskProviders } from '../../../../shared/task-providers'
+import { normalizeTaskProviderSettings } from '../../../../shared/task-providers'
 import { normalizeOpenInApplications } from '../../../../shared/open-in-applications'
 import { createSettingsSearchState, type SettingsSearchState } from './settings-search-state'
+import { normalizeDisabledTuiAgents } from '../../../../shared/tui-agent-selection'
 
 export type SettingsSlice = SettingsSearchState & {
   settings: GlobalSettings | null
@@ -34,12 +44,14 @@ function createOpenInApplicationId(): string {
 function runtimeScopedStateReset(): Partial<AppState> {
   return {
     repos: [],
+    projectGroups: [],
     activeRepoId: null,
     sparsePresetsByRepo: {},
     sparsePresetsLoadingByRepo: {},
     sparsePresetsLoadStatusByRepo: {},
     sparsePresetsErrorByRepo: {},
     worktreesByRepo: {},
+    detectedWorktreesByRepo: {},
     worktreeLineageById: {},
     activeWorktreeId: null,
     deleteStateByWorktreeId: {},
@@ -78,12 +90,15 @@ function runtimeScopedStateReset(): Partial<AppState> {
     deferredSshReconnectTargets: [],
     deferredSshSessionIdsByTabId: {},
     cacheTimerByKey: {},
+    recentQuickCommandIdByGroup: {},
+    showDotfilesByWorktree: {},
     expandedDirs: {},
     pendingExplorerReveal: null,
     openFiles: [],
     editorDrafts: {},
     markdownViewMode: {},
     editorViewMode: {},
+    markdownFrontmatterVisible: {},
     editorCursorLine: {},
     gitIgnoredPathsByWorktree: {},
     activeFileId: null,
@@ -117,7 +132,19 @@ function runtimeScopedStateReset(): Partial<AppState> {
     linearStatusChecked: false,
     linearIssueCache: {},
     linearSearchCache: {},
-    linearTeamCache: {}
+    linearListCache: {},
+    linearTeamCache: {},
+    linearProjectCache: {},
+    linearProjectDetailCache: {},
+    linearProjectIssueCache: {},
+    linearCustomViewCache: {},
+    linearCustomViewDetailCache: {},
+    linearCustomViewIssueCache: {},
+    linearCustomViewProjectCache: {},
+    jiraStatus: { connected: false, viewer: null },
+    jiraStatusChecked: false,
+    jiraIssueCache: {},
+    jiraSearchCache: {}
   }
 }
 
@@ -145,7 +172,7 @@ async function closeRemoteBrowserPagesBeforeRuntimeSwitch(state: AppState): Prom
       return callRuntimeRpc(
         { kind: 'environment', environmentId: handle.environmentId },
         'browser.tabClose',
-        { worktree: `id:${worktreeId}`, page: handle.remotePageId },
+        { worktree: toRuntimeWorktreeSelector(worktreeId), page: handle.remotePageId },
         { timeoutMs: 15_000 }
       )
     })
@@ -218,9 +245,15 @@ async function verifyRuntimeEnvironmentReachable(environmentId: string | null): 
   if (!environmentId) {
     return
   }
-  await callRuntimeRpc({ kind: 'environment', environmentId }, 'repo.list', undefined, {
+  const response = await window.api.runtimeEnvironments.getStatus({
+    selector: environmentId,
     timeoutMs: 15_000
   })
+  const status = unwrapRuntimeRpcResult<RuntimeStatus>(response)
+  assertRuntimeStatusCompatible(status)
+  // Why: the switch probe already proved compatibility; avoid immediately
+  // re-probing through the heavier generic runtime RPC path during hydration.
+  markRuntimeEnvironmentCompatible(environmentId)
 }
 
 export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> = (set, get) => ({
@@ -244,10 +277,19 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
           updates.terminalQuickCommands
         )
       }
-      if ('visibleTaskProviders' in updates) {
-        sanitizedUpdates.visibleTaskProviders = normalizeVisibleTaskProviders(
-          updates.visibleTaskProviders
-        )
+      if ('visibleTaskProviders' in updates || 'defaultTaskSource' in updates) {
+        const taskProviderSettings = normalizeTaskProviderSettings({
+          visibleTaskProviders:
+            'visibleTaskProviders' in updates
+              ? updates.visibleTaskProviders
+              : get().settings?.visibleTaskProviders,
+          defaultTaskSource:
+            'defaultTaskSource' in updates
+              ? updates.defaultTaskSource
+              : get().settings?.defaultTaskSource
+        })
+        sanitizedUpdates.defaultTaskSource = taskProviderSettings.defaultTaskSource
+        sanitizedUpdates.visibleTaskProviders = taskProviderSettings.visibleTaskProviders
       }
       if ('openInApplications' in updates) {
         sanitizedUpdates.openInApplications = normalizeOpenInApplications(
@@ -256,6 +298,9 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
             createId: createOpenInApplicationId
           }
         )
+      }
+      if ('disabledTuiAgents' in updates) {
+        sanitizedUpdates.disabledTuiAgents = normalizeDisabledTuiAgents(updates.disabledTuiAgents)
       }
       const nextSettings = await window.api.settings.set(sanitizedUpdates)
       set((s) => ({ settings: (nextSettings as GlobalSettings | undefined) ?? s.settings }))
@@ -297,6 +342,7 @@ export const createSettingsSlice: StateCreator<AppState, [], [], SettingsSlice> 
       // terminal, browser, and issue IDs cannot be used against the new server
       // while the new environment is loading.
       await get().fetchRepos()
+      await get().fetchProjectGroups()
       await get().fetchAllWorktrees()
       await get().fetchWorktreeLineage()
       await get().fetchBrowserSessionProfiles()

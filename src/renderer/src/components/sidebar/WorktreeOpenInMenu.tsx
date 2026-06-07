@@ -3,19 +3,25 @@ import { ExternalLink, FolderOpen } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
   DropdownMenuSubTrigger
 } from '@/components/ui/dropdown-menu'
 import { useAppStore } from '@/store'
 import { isLocalPathOpenBlocked, showLocalPathOpenBlockedToast } from '@/lib/local-path-open-guard'
+import { getLocalFileManagerLabel } from '@/lib/local-file-manager-label'
+import { OpenInApplicationIcon } from '@/lib/open-in-app-catalog'
 import type { ShellOpenLocalPathFailureReason } from '../../../../shared/shell-open-types'
 import type { OpenInApplication } from '../../../../shared/types'
+
+export { getLocalFileManagerLabel } from '@/lib/local-file-manager-label'
 
 type WorktreeOpenInMenuItemsProps = {
   worktreePath: string
   connectionId?: string | null
   disabled?: boolean
+  labelPrefix?: string
 }
 
 type OpenInMenuEntry = {
@@ -25,24 +31,11 @@ type OpenInMenuEntry = {
   command?: string
 }
 
-export function getLocalFileManagerLabel(userAgent?: string): string {
-  const resolvedUserAgent =
-    userAgent ?? (typeof navigator === 'undefined' ? '' : navigator.userAgent)
-  if (resolvedUserAgent.includes('Mac')) {
-    return 'Finder'
-  }
-  if (resolvedUserAgent.includes('Windows')) {
-    return 'File Explorer'
-  }
-  return 'File Manager'
-}
-
 export function getWorktreeOpenInEntries(
   openInApplications: OpenInApplication[],
   fileManagerLabel: string
 ): OpenInMenuEntry[] {
   return [
-    { id: 'vscode', label: 'VS Code', target: 'external-editor' },
     ...openInApplications.map((application) => ({
       id: application.id,
       label: application.label,
@@ -71,6 +64,16 @@ function showOpenFailureToast(reason: ShellOpenLocalPathFailureReason): void {
 
 function stopMenuPropagation(event: React.SyntheticEvent): void {
   event.stopPropagation()
+}
+
+export function openOpenInAppsSettings(): void {
+  const store = useAppStore.getState()
+  store.openSettingsTarget({
+    pane: 'general',
+    repoId: null,
+    sectionId: 'general-open-in-apps'
+  })
+  store.openSettingsPage()
 }
 
 export async function openWorktreePath(args: {
@@ -115,7 +118,8 @@ function useOpenInWorktreePath({
 export function WorktreeOpenInMenuItems({
   worktreePath,
   connectionId,
-  disabled
+  disabled,
+  labelPrefix = ''
 }: WorktreeOpenInMenuItemsProps): React.JSX.Element {
   const openInWorktreePath = useOpenInWorktreePath({ worktreePath, connectionId })
   const openInApplications = useAppStore((s) => s.settings?.openInApplications ?? [])
@@ -135,9 +139,12 @@ export function WorktreeOpenInMenuItems({
         >
           {entry.target === 'file-manager' ? (
             <FolderOpen className="size-3.5" />
+          ) : entry.command ? (
+            <OpenInApplicationIcon application={{ command: entry.command }} size={14} />
           ) : (
             <ExternalLink className="size-3.5" />
           )}
+          {labelPrefix}
           {entry.label}
         </DropdownMenuItem>
       ))}
@@ -166,6 +173,14 @@ export function WorktreeOpenInSubMenu({
           connectionId={connectionId}
           disabled={disabled}
         />
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={stopMenuPropagation}
+          onSelect={openOpenInAppsSettings}
+          disabled={disabled}
+        >
+          Customize apps...
+        </DropdownMenuItem>
       </DropdownMenuSubContent>
     </DropdownMenuSub>
   )

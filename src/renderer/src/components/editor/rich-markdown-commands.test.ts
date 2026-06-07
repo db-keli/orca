@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { Editor } from '@tiptap/core'
 import { createRichMarkdownExtensions } from './rich-markdown-extensions'
-import { runSlashCommand, slashCommands, type SlashCommandId } from './rich-markdown-commands'
+import { runSlashCommand, slashCommands, type SlashCommandId } from './rich-markdown-slash-commands'
 
 function createEditor(content = '/'): Editor {
   return new Editor({
@@ -39,6 +39,7 @@ describe('rich markdown slash commands', () => {
   it('orders commands under section headers', () => {
     expect(slashCommands.map((command) => `${command.group}:${command.id}`)).toEqual([
       'Headings:heading-1',
+      'Headings:toggle-h1',
       'Headings:heading-2',
       'Headings:heading-3',
       'Basic blocks:blockquote',
@@ -46,6 +47,7 @@ describe('rich markdown slash commands', () => {
       'Basic blocks:bullet-list',
       'Basic blocks:task-list',
       'Basic blocks:text',
+      'Basic blocks:toggle-text',
       'Basic blocks:code-block',
       'Basic blocks:divider',
       'Advanced:table',

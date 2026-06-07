@@ -21,6 +21,7 @@ vi.mock('@/lib/agent-status', async (importOriginal) => {
 })
 
 const runtimeEnvironmentCall = vi.fn()
+const runtimeEnvironmentGetStatus = vi.fn()
 const settingsSet = vi.fn().mockResolvedValue(undefined)
 
 const env2Lineage: WorktreeLineage = {
@@ -37,6 +38,17 @@ beforeEach(() => {
   delete (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__
   clearRuntimeCompatibilityCacheForTests()
   vi.clearAllMocks()
+  runtimeEnvironmentGetStatus.mockResolvedValue({
+    id: 'status-rpc-1',
+    ok: true,
+    result: {
+      runtimeId: 'runtime-2',
+      graphStatus: 'ready',
+      runtimeProtocolVersion: RUNTIME_PROTOCOL_VERSION,
+      minCompatibleRuntimeClientVersion: MIN_COMPATIBLE_RUNTIME_CLIENT_VERSION
+    },
+    _meta: { runtimeId: 'runtime-2' }
+  })
   runtimeEnvironmentCall.mockImplementation(({ method }: { method: string }) => {
     const result =
       method === 'status.get'
@@ -70,22 +82,65 @@ beforeEach(() => {
                 totalCount: 1,
                 truncated: false
               }
-            : method === 'browser.profile.list'
-              ? { profiles: [] }
-              : method === 'worktree.lineageList'
-                ? { lineage: { [env2Lineage.worktreeId]: env2Lineage } }
-                : {}
+            : method === 'worktree.detectedList'
+              ? {
+                  repoId: 'repo-env-2',
+                  authoritative: true,
+                  source: 'git',
+                  worktrees: [
+                    {
+                      ...makeWorktree({
+                        id: 'repo-env-2::/env-2/repo',
+                        repoId: 'repo-env-2',
+                        path: '/env-2/repo'
+                      }),
+                      ownership: 'orca-managed',
+                      selectedCheckout: true,
+                      visible: true
+                    }
+                  ]
+                }
+              : method === 'browser.profile.list'
+                ? { profiles: [] }
+                : method === 'projectGroup.list'
+                  ? { groups: [] }
+                  : method === 'worktree.lineageList'
+                    ? { lineage: { [env2Lineage.worktreeId]: env2Lineage } }
+                    : {}
     return Promise.resolve({ id: 'rpc-1', ok: true, result, _meta: { runtimeId: 'runtime-2' } })
   })
   vi.stubGlobal('window', {
     api: {
       settings: { set: settingsSet },
-      runtimeEnvironments: { call: runtimeEnvironmentCall }
+      runtimeEnvironments: { call: runtimeEnvironmentCall, getStatus: runtimeEnvironmentGetStatus }
     }
   })
 })
 
 describe('createSettingsSlice runtime switching', () => {
+  it('repairs drifted task provider settings before sending updates', async () => {
+    settingsSet.mockResolvedValueOnce({
+      visibleTaskProviders: ['github', 'linear'],
+      defaultTaskSource: 'github'
+    })
+    const store = createTestStore()
+    store.setState({
+      settings: {
+        visibleTaskProviders: ['linear'],
+        defaultTaskSource: 'github'
+      } as AppState['settings']
+    })
+
+    await store.getState().updateSettings({
+      visibleTaskProviders: ['linear']
+    })
+
+    expect(settingsSet).toHaveBeenCalledWith({
+      visibleTaskProviders: ['github', 'linear'],
+      defaultTaskSource: 'github'
+    })
+  })
+
   it('rebases local state to the authoritative settings:set response', async () => {
     settingsSet.mockResolvedValueOnce({
       openInApplications: [{ id: 'cursor', label: 'Cursor', command: 'cursor' }],
@@ -113,6 +168,20 @@ describe('createSettingsSlice runtime switching', () => {
     store.setState({
       settings: { activeRuntimeEnvironmentId: 'env-1' } as AppState['settings'],
       repos: [{ id: 'repo-env-1', path: '/env-1/repo', displayName: 'Env 1' } as never],
+      projectGroups: [
+        {
+          id: 'group-env-1',
+          name: 'Env 1 Group',
+          parentPath: '/env-1',
+          parentGroupId: null,
+          createdFrom: 'manual',
+          tabOrder: 0,
+          isCollapsed: false,
+          color: null,
+          createdAt: 1,
+          updatedAt: 1
+        }
+      ],
       worktreesByRepo: {
         'repo-env-1': [makeWorktree({ id: 'repo-env-1::/env-1/repo', repoId: 'repo-env-1' })]
       },
@@ -144,16 +213,23 @@ describe('createSettingsSlice runtime switching', () => {
       editorDrafts: { '/env-1/repo/stale.md': 'stale' },
       markdownViewMode: { '/env-1/repo/stale.md': 'rich' },
       editorViewMode: { '/env-1/repo/stale.md': 'changes' },
+      markdownFrontmatterVisible: { '/env-1/repo/stale.md': true },
       editorCursorLine: { '/env-1/repo/stale.md': 4 },
+      showDotfilesByWorktree: { 'repo-env-1::/env-1/repo': false },
       gitIgnoredPathsByWorktree: { 'repo-env-1::/env-1/repo': ['dist/'] },
       prCache: { '/env-1/repo::main': { data: null, fetchedAt: Date.now() } },
-      linearIssueCache: { 'LIN-1': { data: { id: 'LIN-1' } as never, fetchedAt: Date.now() } }
+      linearIssueCache: { 'LIN-1': { data: { id: 'LIN-1' } as never, fetchedAt: Date.now() } },
+      jiraIssueCache: { 'JIRA-1': { data: { key: 'JIRA-1' } as never, fetchedAt: Date.now() } }
     })
 
     await expect(store.getState().switchRuntimeEnvironment('env-2')).resolves.toBe(true)
 
     expect(settingsSet).toHaveBeenCalledWith({ activeRuntimeEnvironmentId: 'env-2' })
-    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
+    expect(runtimeEnvironmentGetStatus).toHaveBeenCalledWith({
+      selector: 'env-2',
+      timeoutMs: 15_000
+    })
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
       expect.objectContaining({ selector: 'env-2', method: 'status.get' })
     )
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
@@ -184,6 +260,7 @@ describe('createSettingsSlice runtime switching', () => {
       })
     )
     expect(store.getState().repos.map((repo) => repo.id)).toEqual(['repo-env-2'])
+    expect(store.getState().projectGroups).toEqual([])
     expect(store.getState().worktreesByRepo['repo-env-2']?.map((worktree) => worktree.id)).toEqual([
       'repo-env-2::/env-2/repo'
     ])
@@ -195,12 +272,15 @@ describe('createSettingsSlice runtime switching', () => {
     expect(store.getState().editorDrafts).toEqual({})
     expect(store.getState().markdownViewMode).toEqual({})
     expect(store.getState().editorViewMode).toEqual({})
+    expect(store.getState().markdownFrontmatterVisible).toEqual({})
     expect(store.getState().editorCursorLine).toEqual({})
+    expect(store.getState().showDotfilesByWorktree).toEqual({})
     expect(store.getState().gitIgnoredPathsByWorktree).toEqual({})
     expect(store.getState().ptyIdsByTabId).toEqual({})
     expect(store.getState().browserTabsByWorktree).toEqual({})
     expect(store.getState().prCache).toEqual({})
     expect(store.getState().linearIssueCache).toEqual({})
+    expect(store.getState().jiraIssueCache).toEqual({})
   })
 
   it('does not close host-owned mirrored resources when a paired web client switches servers', async () => {
@@ -286,7 +366,7 @@ describe('createSettingsSlice runtime switching', () => {
   })
 
   it('keeps the current environment when the selected remote server is unreachable', async () => {
-    runtimeEnvironmentCall.mockRejectedValueOnce(
+    runtimeEnvironmentGetStatus.mockRejectedValueOnce(
       new Error('Remote Orca runtime closed the connection.')
     )
     const store = createTestStore()
@@ -300,9 +380,11 @@ describe('createSettingsSlice runtime switching', () => {
     await expect(store.getState().switchRuntimeEnvironment('env-2')).resolves.toBe(false)
 
     expect(settingsSet).not.toHaveBeenCalled()
-    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
-      expect.objectContaining({ selector: 'env-2', method: 'status.get' })
-    )
+    expect(runtimeEnvironmentGetStatus).toHaveBeenCalledWith({
+      selector: 'env-2',
+      timeoutMs: 15_000
+    })
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalled()
     expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
       expect.objectContaining({ selector: 'env-1', method: 'terminal.close' })
     )
@@ -315,22 +397,16 @@ describe('createSettingsSlice runtime switching', () => {
   })
 
   it('keeps the current environment when the selected server is protocol-incompatible', async () => {
-    runtimeEnvironmentCall.mockImplementation(({ method }: { method: string }) => {
-      const result =
-        method === 'status.get'
-          ? {
-              runtimeId: 'runtime-old',
-              graphStatus: 'ready',
-              runtimeProtocolVersion: MIN_COMPATIBLE_RUNTIME_SERVER_VERSION - 1,
-              minCompatibleRuntimeClientVersion: 0
-            }
-          : {}
-      return Promise.resolve({
-        id: 'rpc-1',
-        ok: true,
-        result,
-        _meta: { runtimeId: 'runtime-old' }
-      })
+    runtimeEnvironmentGetStatus.mockResolvedValueOnce({
+      id: 'status-rpc-old',
+      ok: true,
+      result: {
+        runtimeId: 'runtime-old',
+        graphStatus: 'ready',
+        runtimeProtocolVersion: MIN_COMPATIBLE_RUNTIME_SERVER_VERSION - 1,
+        minCompatibleRuntimeClientVersion: 0
+      },
+      _meta: { runtimeId: 'runtime-old' }
     })
     const store = createTestStore()
     store.setState({
@@ -342,12 +418,11 @@ describe('createSettingsSlice runtime switching', () => {
     await expect(store.getState().switchRuntimeEnvironment('env-old')).resolves.toBe(false)
 
     expect(settingsSet).not.toHaveBeenCalled()
-    expect(runtimeEnvironmentCall).toHaveBeenCalledWith(
-      expect.objectContaining({ selector: 'env-old', method: 'status.get' })
-    )
-    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
-      expect.objectContaining({ selector: 'env-old', method: 'repo.list' })
-    )
+    expect(runtimeEnvironmentGetStatus).toHaveBeenCalledWith({
+      selector: 'env-old',
+      timeoutMs: 15_000
+    })
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalled()
     expect(toast.error).toHaveBeenCalledWith('Failed to switch servers', {
       description: expect.stringContaining('server is too old')
     })

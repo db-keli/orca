@@ -6,9 +6,13 @@ import { ipcMain, webContents } from 'electron'
 import { resolve } from 'path'
 import type {
   Repo,
+  GitHubCreateIssueFields,
   GitHubIssueUpdate,
   GitHubOwnerRepo,
-  GitHubPullRequestStateUpdate
+  GitHubPullRequestStateUpdate,
+  GitHubPRRefreshCandidate,
+  GitHubPRRefreshReason,
+  PRRefreshOutcome
 } from '../../shared/types'
 import type { Store } from '../persistence'
 import type { StatsCollector } from '../stats/collector'
@@ -16,6 +20,7 @@ import {
   getPRForBranch,
   getIssue,
   getRepoSlug,
+  getRepoUpstream,
   listIssues,
   listWorkItems,
   countWorkItems,
@@ -28,6 +33,7 @@ import {
   listAssignableUsers,
   getAuthenticatedViewer,
   getPRChecks,
+  getPRCheckDetails,
   getPRComments,
   resolveReviewThread,
   setPRFileViewed,
@@ -35,12 +41,21 @@ import {
   addPRReviewCommentReply,
   updatePRTitle,
   mergePR,
+  setPRAutoMerge,
   updatePRState,
   rerunPRChecks,
   requestPRReviewers,
+  removePRReviewers,
   checkOrcaStarred,
   starOrca
 } from '../github/client'
+import {
+  clearVisiblePRRefreshWindow,
+  enqueuePRRefresh,
+  refreshPRNow,
+  reportVisiblePRRefreshCandidates,
+  setPRRefreshOutcomeObserver
+} from '../github/pr-refresh-coordinator'
 import { getWorkItemDetails, getPRFileContents } from '../github/work-item-details'
 import { getRateLimit } from '../github/rate-limit'
 import { diagnoseGhAuth } from '../github/auth-diagnose'
@@ -81,6 +96,11 @@ import type {
   UpdateProjectItemFieldArgs,
   UpdatePullRequestBySlugArgs
 } from '../../shared/github-project-types'
+import { appStarSourceSchema } from '../../shared/gh-star-source'
+import { track } from '../telemetry/client'
+import { getCohortAtEmit } from '../telemetry/cohort-classifier'
+
+const prRefreshVisibilityCleanupRegistered = new Set<number>()
 
 // Why: notify every renderer (each window has its own SWR cache instance)
 // that a work item was mutated locally so they can drop their cached entry
@@ -133,15 +153,44 @@ function repoConnectionId(repo: Repo): string | null {
 }
 
 export function registerGitHubHandlers(store: Store, stats: StatsCollector): void {
+  function recordPRIfNeeded(repo: Repo, outcome: PRRefreshOutcome): void {
+    if (outcome.kind === 'found' && !stats.hasCountedPR(outcome.pr.url)) {
+      stats.record({
+        type: 'pr_created',
+        at: Date.now(),
+        repoId: repo.id,
+        meta: { prNumber: outcome.pr.number, prUrl: outcome.pr.url }
+      })
+    }
+  }
+
+  setPRRefreshOutcomeObserver((candidate, outcome) => {
+    const repo =
+      store.getRepos().find((r) => r.id === candidate.repoId) ??
+      store.getRepos().find((r) => resolve(r.path) === resolve(candidate.repoPath))
+    if (repo) {
+      recordPRIfNeeded(repo, outcome)
+    }
+  })
+
   ipcMain.handle(
     'gh:prForBranch',
-    async (_event, args: { repoPath: string; branch: string; linkedPRNumber?: number | null }) => {
+    async (
+      _event,
+      args: {
+        repoPath: string
+        branch: string
+        linkedPRNumber?: number | null
+        fallbackPRNumber?: number | null
+      }
+    ) => {
       const repo = assertRegisteredRepo(args, store)
       const pr = await getPRForBranch(
         repo.path,
         args.branch,
         args.linkedPRNumber ?? null,
-        repoConnectionId(repo)
+        repoConnectionId(repo),
+        args.linkedPRNumber == null ? (args.fallbackPRNumber ?? null) : null
       )
       // Emit pr_created when a PR is first detected for a branch.
       // Why here: the renderer polls gh:prForBranch to check PR status per worktree.
@@ -155,6 +204,74 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
         })
       }
       return pr
+    }
+  )
+
+  ipcMain.handle(
+    'gh:refreshPRNow',
+    async (_event, args: { candidate: GitHubPRRefreshCandidate }) => {
+      const repo = assertRegisteredRepo(args.candidate.repoPath, store)
+      const outcome = await refreshPRNow({
+        ...args.candidate,
+        repoPath: repo.path,
+        repoId: repo.id,
+        connectionId: repo.connectionId ?? args.candidate.connectionId,
+        connectionState: repo.connectionId ? 'connected' : args.candidate.connectionState
+      })
+      recordPRIfNeeded(repo, outcome)
+      return outcome
+    }
+  )
+
+  ipcMain.handle(
+    'gh:enqueuePRRefresh',
+    (
+      _event,
+      args: {
+        candidate: GitHubPRRefreshCandidate
+        reason: GitHubPRRefreshReason
+        priority?: number
+      }
+    ) => {
+      const repo = assertRegisteredRepo(args.candidate.repoPath, store)
+      enqueuePRRefresh(
+        {
+          ...args.candidate,
+          repoPath: repo.path,
+          repoId: repo.id,
+          connectionId: repo.connectionId ?? args.candidate.connectionId,
+          connectionState: repo.connectionId ? 'connected' : args.candidate.connectionState
+        },
+        args.reason,
+        args.priority ?? 0
+      )
+      return true
+    }
+  )
+
+  ipcMain.handle(
+    'gh:reportVisiblePRRefreshCandidates',
+    (event, args: { candidates: GitHubPRRefreshCandidate[]; generation: number }) => {
+      const senderId = event.sender.id
+      if (!prRefreshVisibilityCleanupRegistered.has(senderId)) {
+        prRefreshVisibilityCleanupRegistered.add(senderId)
+        event.sender.once('destroyed', () => {
+          prRefreshVisibilityCleanupRegistered.delete(senderId)
+          clearVisiblePRRefreshWindow(senderId)
+        })
+      }
+      const candidates = args.candidates.map((candidate) => {
+        const repo = assertRegisteredRepo(candidate.repoPath, store)
+        return {
+          ...candidate,
+          repoPath: repo.path,
+          repoId: repo.id,
+          connectionId: repo.connectionId ?? candidate.connectionId,
+          connectionState: repo.connectionId ? 'connected' : candidate.connectionState
+        }
+      })
+      reportVisiblePRRefreshCandidates(candidates, args.generation, senderId)
+      return true
     }
   )
 
@@ -178,14 +295,19 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
 
   ipcMain.handle(
     'gh:createIssue',
-    (_event, args: { repoPath: string; title: string; body: string }) => {
+    (_event, args: { repoPath: string; title: string; body: string } & GitHubCreateIssueFields) => {
       const repo = assertRegisteredRepo(args, store)
+      const fields =
+        args.labels !== undefined || args.assignees !== undefined
+          ? { labels: args.labels, assignees: args.assignees }
+          : undefined
       return createIssue(
         repo.path,
         args.title,
         args.body,
         repo.issueSourcePreference,
-        repoConnectionId(repo)
+        repoConnectionId(repo),
+        fields
       )
     }
   )
@@ -194,7 +316,14 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
     'gh:listWorkItems',
     (
       _event,
-      args: { repoPath: string; repoId?: string; limit?: number; query?: string; before?: string }
+      args: {
+        repoPath: string
+        repoId?: string
+        limit?: number
+        query?: string
+        before?: string
+        noCache?: boolean
+      }
     ) => {
       const repo = assertRegisteredRepo(args, store)
       return listWorkItems(
@@ -203,7 +332,8 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
         args.query,
         args.before,
         repo.issueSourcePreference,
-        repoConnectionId(repo)
+        repoConnectionId(repo),
+        args.noCache
       )
     }
   )
@@ -275,6 +405,11 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
     return getRepoSlug(repo.path, repoConnectionId(repo))
   })
 
+  ipcMain.handle('gh:repoUpstream', (_event, args: { repoPath: string }) => {
+    const repo = assertRegisteredRepo(args, store)
+    return getRepoUpstream(repo.path, repoConnectionId(repo))
+  })
+
   ipcMain.handle(
     'gh:prChecks',
     (
@@ -295,6 +430,34 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
         args.prRepo ?? null,
         {
           noCache: args.noCache
+        },
+        repoConnectionId(repo)
+      )
+    }
+  )
+
+  ipcMain.handle(
+    'gh:prCheckDetails',
+    (
+      _event,
+      args: {
+        repoPath: string
+        checkRunId?: number
+        workflowRunId?: number
+        checkName?: string
+        url?: string | null
+        prRepo?: GitHubOwnerRepo | null
+      }
+    ) => {
+      const repo = assertRegisteredRepo(args, store)
+      return getPRCheckDetails(
+        repo.path,
+        {
+          checkRunId: args.checkRunId,
+          workflowRunId: args.workflowRunId,
+          checkName: args.checkName,
+          url: args.url,
+          prRepo: args.prRepo ?? null
         },
         repoConnectionId(repo)
       )
@@ -382,12 +545,14 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
       event,
       args: {
         repoPath: string
+        repoId?: string
         prNumber: number
         commentId: number
         body: string
         threadId?: string
         path?: string
         line?: number
+        prRepo?: GitHubOwnerRepo | null
       }
     ) => {
       const repo = assertRegisteredRepo(args, store)
@@ -416,7 +581,8 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
         args.threadId,
         args.path,
         args.line,
-        repoConnectionId(repo)
+        repoConnectionId(repo),
+        args.prRepo ?? null
       )
       if (result.ok) {
         broadcastWorkItemMutated(
@@ -545,6 +711,35 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
   )
 
   ipcMain.handle(
+    'gh:setPRAutoMerge',
+    async (
+      event,
+      args: {
+        repoPath: string
+        prNumber: number
+        enabled: boolean
+        prRepo?: GitHubOwnerRepo | null
+      }
+    ) => {
+      const repo = assertRegisteredRepo(args, store)
+      const result = await setPRAutoMerge(
+        repo.path,
+        args.prNumber,
+        args.enabled,
+        repoConnectionId(repo),
+        args.prRepo ?? null
+      )
+      if (result.ok) {
+        broadcastWorkItemMutated(
+          { repoPath: repo.path, repoId: repo.id, type: 'pr', number: args.prNumber },
+          event.sender.id
+        )
+      }
+      return result
+    }
+  )
+
+  ipcMain.handle(
     'gh:updatePRState',
     async (
       event,
@@ -618,6 +813,26 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
   )
 
   ipcMain.handle(
+    'gh:removePRReviewers',
+    async (event, args: { repoPath: string; prNumber: number; reviewers: string[] }) => {
+      const repo = assertRegisteredRepo(args, store)
+      const result = await removePRReviewers(
+        repo.path,
+        args.prNumber,
+        args.reviewers,
+        repoConnectionId(repo)
+      )
+      if (result.ok) {
+        broadcastWorkItemMutated(
+          { repoPath: repo.path, repoId: repo.id, type: 'pr', number: args.prNumber },
+          event.sender.id
+        )
+      }
+      return result
+    }
+  )
+
+  ipcMain.handle(
     'gh:updateIssue',
     async (
       event,
@@ -645,7 +860,14 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
     'gh:addIssueComment',
     async (
       event,
-      args: { repoPath: string; number: number; body: string; type?: 'issue' | 'pr' }
+      args: {
+        repoPath: string
+        repoId?: string
+        number: number
+        body: string
+        type?: 'issue' | 'pr'
+        prRepo?: GitHubOwnerRepo | null
+      }
     ) => {
       const repo = assertRegisteredRepo(args, store)
       if (typeof args.number !== 'number' || !Number.isInteger(args.number) || args.number < 1) {
@@ -658,7 +880,8 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
         repo.path,
         args.number,
         args.body.trim(),
-        repoConnectionId(repo)
+        repoConnectionId(repo),
+        args.prRepo ?? null
       )
       if (result.ok) {
         // Why: PR conversation comments hit `/issues/N/comments` too, but the
@@ -688,7 +911,19 @@ export function registerGitHubHandlers(store: Store, stats: StatsCollector): voi
   // Star operations target the Orca repo itself — no repoPath validation needed
   ipcMain.handle('gh:viewer', () => getAuthenticatedViewer())
   ipcMain.handle('gh:checkOrcaStarred', () => checkOrcaStarred())
-  ipcMain.handle('gh:starOrca', () => starOrca())
+  ipcMain.handle('gh:starOrca', async (_event, source: unknown) => {
+    const sourceParse = appStarSourceSchema.safeParse(source)
+    const starred = await starOrca()
+    if (starred && sourceParse.success) {
+      // Why: this main-owned event bypasses renderer telemetry IPC, so cohort
+      // context must be attached here on the successful star path.
+      track('app_starred_orca', {
+        source: sourceParse.data,
+        ...getCohortAtEmit()
+      })
+    }
+    return starred
+  })
 
   // Why: `rate_limit` is exempt from GitHub's rate-limit accounting, so
   // polling is cheap. A 30s in-process cache still avoids the gh subprocess

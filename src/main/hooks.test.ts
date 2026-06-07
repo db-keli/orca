@@ -2,7 +2,7 @@
 import type { Repo } from '../shared/types'
 
 import { describe, expect, it, vi } from 'vitest'
-import { parseOrcaYaml } from './hooks'
+import { getDefaultTabsLaunch, parseOrcaYaml } from './hooks'
 
 // Mock fs and path used by loadHooks
 vi.mock('fs', () => ({
@@ -142,6 +142,44 @@ describe('parseOrcaYaml', () => {
       issueCommand: 'claude -p "Read issue #{{issue}}"'
     })
   })
+
+  it('parses default terminal tabs from orca.yaml', () => {
+    const yaml = [
+      'defaultTabs:',
+      '  - title: Claude',
+      '    color: "#f97316"',
+      '    command: claude',
+      '  - title: LocalHost',
+      '    color: "#9ca3af"',
+      '    command: pnpm dev',
+      '  - title: Notes'
+    ].join('\n')
+
+    expect(parseOrcaYaml(yaml)).toEqual({
+      scripts: {},
+      defaultTabs: [
+        { title: 'Claude', color: '#f97316', command: 'claude' },
+        { title: 'LocalHost', color: '#9ca3af', command: 'pnpm dev' },
+        { title: 'Notes' }
+      ]
+    })
+  })
+
+  it('drops invalid default tab entries and unsafe color values', () => {
+    const yaml = [
+      'defaultTabs:',
+      '  - title: Server',
+      '    color: "red"',
+      '    command: pnpm dev',
+      '  - 42',
+      '  - title: ""'
+    ].join('\n')
+
+    expect(parseOrcaYaml(yaml)).toEqual({
+      scripts: {},
+      defaultTabs: [{ title: 'Server', command: 'pnpm dev' }]
+    })
+  })
 })
 
 describe('hasUnrecognizedOrcaYamlKeys', () => {
@@ -174,7 +212,15 @@ describe('hasUnrecognizedOrcaYamlKeys', () => {
   it('returns false when the file contains only recognised keys', async () => {
     const fs = await import('fs')
     vi.mocked(fs.readFileSync).mockReturnValue(
-      'scripts:\n  setup: |\n    pnpm install\nissueCommand: |\n  claude -p "test"\n'
+      [
+        'scripts:',
+        '  setup: |',
+        '    pnpm install',
+        'issueCommand: |',
+        '  claude -p "test"',
+        'defaultTabs:',
+        '  - title: Claude'
+      ].join('\n')
     )
 
     const { hasUnrecognizedOrcaYamlKeys } = await import('./hooks')
@@ -291,6 +337,7 @@ describe('getEffectiveHooks', () => {
   const makeRepo = (hookSettings?: {
     mode?: 'auto' | 'override'
     setupRunPolicy?: 'ask' | 'run-by-default' | 'skip-by-default'
+    commandSourcePolicy?: 'shared-only' | 'local-only' | 'run-both'
     scripts?: { setup: string; archive: string }
   }) =>
     ({
@@ -345,26 +392,41 @@ describe('getEffectiveHooks', () => {
     expect(result?.scripts.setup).not.toContain('old-version')
   })
 
-  it('falls back to legacy UI hooks when yaml is missing', async () => {
+  it('falls back to legacy local hooks when policy is unset and yaml is missing', async () => {
     const fs = await import('fs')
     vi.mocked(fs.existsSync).mockReturnValue(false)
 
     const { getEffectiveHooks } = await import('./hooks')
     const repo = makeRepo({
       mode: 'override',
-      scripts: { setup: 'echo "legacy ui setup"', archive: 'echo "legacy archive"' }
+      scripts: { setup: 'echo "local setup"', archive: 'echo "local archive"' }
     })
     const result = getEffectiveHooks(repo)
 
     expect(result).toEqual({
       scripts: {
-        setup: 'echo "legacy ui setup"',
-        archive: 'echo "legacy archive"'
+        setup: 'echo "local setup"',
+        archive: 'echo "local archive"'
       }
     })
   })
 
-  it('ignores legacy UI override settings when yaml exists', async () => {
+  it('does not fall back to local hooks when policy is explicitly shared-only', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+
+    const { getEffectiveHooks } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      commandSourcePolicy: 'shared-only',
+      scripts: { setup: 'echo "local setup"', archive: 'echo "local archive"' }
+    })
+    const result = getEffectiveHooks(repo)
+
+    expect(result).toBeNull()
+  })
+
+  it('uses local settings over shared yaml settings by default when local hooks exist', async () => {
     const fs = await import('fs')
     vi.mocked(fs.existsSync).mockReturnValue(true)
     vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  setup: |\n    echo "yaml setup"\n')
@@ -378,12 +440,52 @@ describe('getEffectiveHooks', () => {
 
     expect(result).toEqual({
       scripts: {
-        setup: 'echo "yaml setup"'
+        setup: 'echo "ui override"'
       }
     })
   })
 
-  it('falls back per hook when orca.yaml defines only one command', async () => {
+  it('uses only local settings when command source policy is local-only', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  setup: |\n    echo "yaml setup"\n')
+
+    const { getEffectiveHooks } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      commandSourcePolicy: 'local-only',
+      scripts: { setup: 'echo "local setup"', archive: '' }
+    })
+    const result = getEffectiveHooks(repo)
+
+    expect(result).toEqual({
+      scripts: {
+        setup: 'echo "local setup"'
+      }
+    })
+  })
+
+  it('runs yaml before local settings when command source policy is run-both', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  setup: |\n    echo "yaml setup"\n')
+
+    const { getEffectiveHooks } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      commandSourcePolicy: 'run-both',
+      scripts: { setup: 'echo "local setup"', archive: '' }
+    })
+    const result = getEffectiveHooks(repo)
+
+    expect(result).toEqual({
+      scripts: {
+        setup: 'echo "yaml setup"\necho "local setup"'
+      }
+    })
+  })
+
+  it('uses local settings by default even when orca.yaml defines only one command', async () => {
     const fs = await import('fs')
     vi.mocked(fs.existsSync).mockReturnValue(true)
     vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  archive: |\n    echo "yaml archive"\n')
@@ -398,6 +500,68 @@ describe('getEffectiveHooks', () => {
     expect(result).toEqual({
       scripts: {
         setup: 'echo "legacy setup"',
+        archive: 'echo "legacy archive"'
+      }
+    })
+  })
+
+  it('keeps shared setup when only archive has a legacy local script', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      'scripts:\n  setup: |\n    echo "yaml setup"\n  archive: |\n    echo "yaml archive"\n'
+    )
+
+    const { getEffectiveHooks } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      scripts: { setup: '', archive: 'echo "legacy archive"' }
+    })
+    const result = getEffectiveHooks(repo)
+
+    expect(result).toEqual({
+      scripts: {
+        setup: 'echo "yaml setup"',
+        archive: 'echo "legacy archive"'
+      }
+    })
+  })
+
+  it('uses local settings by default when yaml exists without supported hooks', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('futureFeature: enabled\n')
+
+    const { getEffectiveHooks } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      scripts: { setup: 'echo "legacy setup"', archive: 'echo "legacy archive"' }
+    })
+    const result = getEffectiveHooks(repo)
+
+    expect(result).toEqual({
+      scripts: {
+        setup: 'echo "legacy setup"',
+        archive: 'echo "legacy archive"'
+      }
+    })
+  })
+
+  it('treats legacy shared-first policy as orca.yaml only', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  archive: |\n    echo "yaml archive"\n')
+
+    const { getEffectiveHooks } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      commandSourcePolicy: 'shared-first' as never,
+      scripts: { setup: 'echo "legacy setup"', archive: 'echo "legacy archive"' }
+    })
+    const result = getEffectiveHooks(repo)
+
+    expect(result).toEqual({
+      scripts: {
         archive: 'echo "yaml archive"'
       }
     })
@@ -412,6 +576,67 @@ describe('getEffectiveHooks', () => {
     const result = getEffectiveHooks(repo)
 
     expect(result).toBeNull()
+  })
+
+  it('falls back to legacy local setup source only when yaml is missing', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(false)
+
+    const { getSetupCommandSource } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      scripts: { setup: 'echo "legacy setup"', archive: '' }
+    })
+    const result = getSetupCommandSource(repo)
+
+    expect(result).toEqual({ source: 'local', command: 'echo "legacy setup"' })
+  })
+
+  it('uses local setup source by default when yaml omits setup', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  archive: |\n    echo "yaml archive"\n')
+
+    const { getSetupCommandSource } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      scripts: { setup: 'echo "legacy setup"', archive: '' }
+    })
+    const result = getSetupCommandSource(repo)
+
+    expect(result).toEqual({ source: 'local', command: 'echo "legacy setup"' })
+  })
+
+  it('uses local setup source by default when yaml exists without supported hooks', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('futureFeature: enabled\n')
+
+    const { getSetupCommandSource } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      scripts: { setup: 'echo "legacy setup"', archive: '' }
+    })
+    const result = getSetupCommandSource(repo)
+
+    expect(result).toEqual({ source: 'local', command: 'echo "legacy setup"' })
+  })
+
+  it('uses shared setup source when only archive has a legacy local script', async () => {
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue(
+      'scripts:\n  setup: |\n    echo "yaml setup"\n  archive: |\n    echo "yaml archive"\n'
+    )
+
+    const { getSetupCommandSource } = await import('./hooks')
+    const repo = makeRepo({
+      mode: 'override',
+      scripts: { setup: '', archive: 'echo "legacy archive"' }
+    })
+    const result = getSetupCommandSource(repo)
+
+    expect(result).toEqual({ source: 'yaml', command: 'echo "yaml setup"' })
   })
 })
 
@@ -570,6 +795,52 @@ describe('runHook', () => {
       })
     }
   })
+
+  it('settles WSL hooks when wsl.exe never reports completion', async () => {
+    vi.useFakeTimers()
+    execMock.mockReset()
+    execFileMock.mockReset()
+    const killMock = vi.fn()
+    execFileMock.mockImplementation(() => ({ kill: killMock }) as never)
+
+    const fs = await import('fs')
+    vi.mocked(fs.existsSync).mockReturnValue(true)
+    vi.mocked(fs.readFileSync).mockReturnValue('scripts:\n  setup: |\n    echo hello\n')
+
+    const originalPlatform = process.platform
+    Object.defineProperty(process, 'platform', {
+      configurable: true,
+      value: 'win32'
+    })
+
+    try {
+      const { runHook } = await import('./hooks')
+      const promise = runHook('setup', '\\\\wsl.localhost\\Ubuntu\\home\\jin\\feature', {
+        ...makeRepo(),
+        path: 'C:\\Users\\jinwo\\git\\orca'
+      })
+      let settled = false
+      void promise.finally(() => {
+        settled = true
+      })
+
+      await vi.advanceTimersByTimeAsync(120_000)
+      await Promise.resolve()
+
+      expect(settled).toBe(true)
+      await expect(promise).resolves.toMatchObject({
+        success: false,
+        output: expect.stringContaining('Hook timed out')
+      })
+      expect(killMock).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+      Object.defineProperty(process, 'platform', {
+        configurable: true,
+        value: originalPlatform
+      })
+    }
+  })
 })
 
 describe('shouldRunSetupForCreate', () => {
@@ -607,5 +878,65 @@ describe('shouldRunSetupForCreate', () => {
 
     expect(shouldRunSetupForCreate(makeRepo('skip-by-default'), 'run')).toBe(true)
     expect(shouldRunSetupForCreate(makeRepo('run-by-default'), 'skip')).toBe(false)
+  })
+})
+
+describe('getDefaultTabsLaunch', () => {
+  const makeRepo = (
+    setupRunPolicy?: 'ask' | 'run-by-default' | 'skip-by-default',
+    commandSourcePolicy?: 'local-only' | 'run-both' | 'shared-only'
+  ) =>
+    ({
+      id: 'test-id',
+      path: '/test/repo',
+      displayName: 'Test Repo',
+      badgeColor: '#000',
+      addedAt: Date.now(),
+      hookSettings: {
+        mode: 'auto',
+        setupRunPolicy,
+        commandSourcePolicy,
+        scripts: { setup: '', archive: '' }
+      }
+    }) as unknown as Repo
+
+  it('opts into default tab command execution through the setup decision', () => {
+    const hooks = {
+      scripts: {},
+      defaultTabs: [{ title: 'Server', command: 'pnpm dev' }]
+    }
+
+    expect(getDefaultTabsLaunch(hooks, makeRepo('skip-by-default'), 'run')).toEqual({
+      tabs: hooks.defaultTabs,
+      runCommands: true
+    })
+    expect(getDefaultTabsLaunch(hooks, makeRepo('run-by-default'), 'skip')).toEqual({
+      tabs: hooks.defaultTabs,
+      runCommands: false
+    })
+  })
+
+  it('creates commandless default tabs without requiring setup approval', () => {
+    const hooks = {
+      scripts: {},
+      defaultTabs: [{ title: 'Notes' }]
+    }
+
+    expect(getDefaultTabsLaunch(hooks, makeRepo('ask'))).toEqual({
+      tabs: hooks.defaultTabs,
+      runCommands: false
+    })
+  })
+
+  it('does not run shared default tab commands when command source is local-only', () => {
+    const hooks = {
+      scripts: {},
+      defaultTabs: [{ title: 'Server', command: 'pnpm dev' }]
+    }
+
+    expect(getDefaultTabsLaunch(hooks, makeRepo('run-by-default', 'local-only'))).toEqual({
+      tabs: hooks.defaultTabs,
+      runCommands: false
+    })
   })
 })

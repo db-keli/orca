@@ -25,7 +25,8 @@ import {
   waitForActiveTerminalManager,
   waitForTerminalOutput,
   waitForPaneCount,
-  getTerminalContent
+  getTerminalContent,
+  sendToTerminal
 } from './helpers/terminal'
 import {
   waitForSessionReady,
@@ -42,12 +43,7 @@ import {
 import { pressShortcut } from './helpers/shortcuts'
 
 async function setPaneTitleFromTerminalMenu(page: Page, title: string): Promise<void> {
-  const modifiers: ('Alt' | 'Control' | 'Meta' | 'Shift')[] =
-    process.platform === 'win32' ? ['Control'] : []
-  await page
-    .locator('.xterm:visible')
-    .first()
-    .click({ button: 'right', position: { x: 40, y: 40 }, modifiers })
+  await openTerminalContextMenu(page)
   await page.getByText('Set Title…', { exact: true }).click()
   const titleInput = page.locator('.pane-title-input').first()
   await expect(titleInput).toBeVisible()
@@ -61,6 +57,24 @@ async function setPaneTitleFromTerminalMenu(page: Page, title: string): Promise<
     await titleInput.evaluateAll(([input]) => (input as HTMLElement | undefined)?.blur())
   }
   await expect(titleInput).toHaveCount(0)
+}
+
+async function openTerminalContextMenu(page: Page): Promise<void> {
+  const modifiers: ('Alt' | 'Control' | 'Meta' | 'Shift')[] = (await page.evaluate(() =>
+    navigator.userAgent.includes('Windows')
+  ))
+    ? ['Control']
+    : []
+  const isMac = await page.evaluate(() => navigator.userAgent.includes('Mac'))
+  await page
+    .locator('.xterm:visible')
+    .first()
+    .click({
+      button: isMac ? 'left' : 'right',
+      position: { x: 40, y: 40 },
+      modifiers: isMac ? ['Control'] : modifiers
+    })
+  await expect(page.getByText('Set Title…', { exact: true })).toBeVisible()
 }
 
 async function getTabCustomTitle(
@@ -109,6 +123,18 @@ async function expectSavedLayoutNotToContainTitle(
       { timeout: 3_000 }
     )
     .toBe(false)
+}
+
+async function readVisiblePaneContents(page: Page): Promise<string[]> {
+  const snapshot = await waitForPaneIdentitySnapshot(page, 2)
+  return page.evaluate((tabId) => {
+    const manager = window.__paneManagers?.get(tabId)
+    return (
+      manager
+        ?.getPanes()
+        .map((pane) => pane.serializeAddon?.serialize?.({ scrollback: 200 }) ?? '') ?? []
+    )
+  }, snapshot.tabId)
 }
 
 // Why: only the pointer-drag resize test needs a visible window (pointer
@@ -209,6 +235,130 @@ test.describe('Terminal Panes', () => {
     await waitForTerminalOutput(orcaPage, `${marker}=${expectedPaneKey}`)
 
     expect(activeLeafId).toMatch(UUID_RE)
+  })
+
+  test('terminal context menu copies the stable pane ID', async ({ orcaPage }) => {
+    const snapshot = await waitForPaneIdentitySnapshot(orcaPage, 1)
+    const leafId = snapshot.panes[0]?.leafId
+    if (!leafId) {
+      throw new Error('No terminal pane leaf id found')
+    }
+    const expectedPaneKey = `${snapshot.tabId}:${leafId}`
+
+    await openTerminalContextMenu(orcaPage)
+    await orcaPage.getByText('Copy Pane ID', { exact: true }).click()
+
+    await expect
+      .poll(() => orcaPage.evaluate(() => window.api.ui.readClipboardText()), { timeout: 3_000 })
+      .toBe(expectedPaneKey)
+    await expect(orcaPage.getByText('Pane ID copied', { exact: true })).toBeVisible()
+    expect(leafId).toMatch(UUID_RE)
+  })
+
+  test('first Set Title from terminal context menu stays open for typing', async ({ orcaPage }) => {
+    const title = `First menu title ${Date.now()}`
+
+    await openTerminalContextMenu(orcaPage)
+    await orcaPage.getByText('Set Title…', { exact: true }).click()
+
+    const titleInput = orcaPage.locator('.pane-title-input').first()
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+    await orcaPage.waitForTimeout(250)
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+
+    await titleInput.fill(title)
+    await titleInput.press('Enter')
+
+    await expect(titleInput).toHaveCount(0)
+    await expect(orcaPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
+  })
+
+  test('Set Title input stays open when clicked in a split terminal', async ({ orcaPage }) => {
+    await splitActiveTerminalPane(orcaPage, 'vertical')
+    await waitForPaneCount(orcaPage, 2)
+    await splitActiveTerminalPane(orcaPage, 'horizontal')
+    await waitForPaneCount(orcaPage, 3)
+
+    await openTerminalContextMenu(orcaPage)
+    await orcaPage.getByText('Set Title…', { exact: true }).click()
+
+    const titleInput = orcaPage.locator('.pane-title-input').first()
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+
+    // Why: pane-level pointerdown focuses xterm for terminal clicks. Pane-local
+    // controls must be excluded or clicking the already-open title input blurs
+    // it and commits an empty title, which looks like the editor flashed closed.
+    await titleInput.evaluate((input) => {
+      const pointerInit: PointerEventInit = {
+        bubbles: true,
+        cancelable: true,
+        pointerId: 1,
+        pointerType: 'mouse'
+      }
+      input.dispatchEvent(new PointerEvent('pointerdown', pointerInit))
+      input.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+      input.dispatchEvent(new PointerEvent('pointerup', pointerInit))
+      input.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }))
+      input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    })
+    await expect
+      .poll(
+        () => titleInput.evaluate((input) => input.isConnected && document.activeElement === input),
+        { timeout: 1_000 }
+      )
+      .toBe(true)
+
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+  })
+
+  test('Set Title survives an early blur during first focus handoff', async ({ orcaPage }) => {
+    await openTerminalContextMenu(orcaPage)
+    await orcaPage.evaluate(() => {
+      const blurOnFirstTitleFocus = (event: FocusEvent): void => {
+        const target = event.target
+        if (
+          !(target instanceof HTMLInputElement) ||
+          !target.classList.contains('pane-title-input')
+        ) {
+          return
+        }
+        document.removeEventListener('focusin', blurOnFirstTitleFocus, true)
+        queueMicrotask(() => target.blur())
+      }
+      document.addEventListener('focusin', blurOnFirstTitleFocus, true)
+    })
+    await orcaPage.getByText('Set Title…', { exact: true }).click()
+
+    const titleInput = orcaPage.locator('.pane-title-input').first()
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+    await orcaPage.waitForTimeout(250)
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+  })
+
+  test('Set Title still commits by blur after focus settles', async ({ orcaPage }) => {
+    const title = `Blur commit title ${Date.now()}`
+
+    await openTerminalContextMenu(orcaPage)
+    await orcaPage.getByText('Set Title…', { exact: true }).click()
+
+    const titleInput = orcaPage.locator('.pane-title-input').first()
+    await expect(titleInput).toBeVisible()
+    await expect(titleInput).toBeFocused()
+    await orcaPage.waitForTimeout(100)
+    await titleInput.fill(title)
+    await orcaPage
+      .locator('.xterm:visible')
+      .first()
+      .click({ position: { x: 40, y: 60 } })
+
+    await expect(titleInput).toHaveCount(0)
+    await expect(orcaPage.locator('.pane-title-text', { hasText: title })).toHaveCount(1)
   })
 
   test('Set Title stays pane-local during agent title churn', async ({ orcaPage }) => {
@@ -562,6 +712,54 @@ test.describe('Terminal Panes', () => {
         { timeout: 5_000, message: 'Pane widths did not change after dragging divider' }
       )
       .toBe(true)
+  })
+
+  test('@headful resizing split panes forwards only the settled PTY size', async ({ orcaPage }) => {
+    await splitActiveTerminalPane(orcaPage, 'vertical')
+    const snapshot = await waitForPaneIdentitySnapshot(orcaPage, 2)
+    const ptyIds = snapshot.panes
+      .map((pane) => pane.ptyId)
+      .filter((ptyId): ptyId is string => Boolean(ptyId))
+
+    for (const ptyId of ptyIds) {
+      await sendToTerminal(
+        orcaPage,
+        ptyId,
+        "export PS1='ISSUE2910_PROMPT$ '; export PROMPT=\"$PS1\"; trap 'printf \"\\nISSUE2910_WINCH\\n\"' WINCH; clear; printf 'ISSUE2910_READY\\n'\r"
+      )
+    }
+
+    await expect
+      .poll(
+        async () =>
+          (await readVisiblePaneContents(orcaPage)).every((content) =>
+            content.includes('ISSUE2910_READY')
+          ),
+        { timeout: 10_000, message: 'Split panes did not receive resize-regression prompt setup' }
+      )
+      .toBe(true)
+
+    const divider = orcaPage.locator('.pane-divider.is-vertical').first()
+    await expect(divider).toBeVisible({ timeout: 3_000 })
+    const box = await divider.boundingBox()
+    expect(box).not.toBeNull()
+
+    const startX = box!.x + box!.width / 2
+    const startY = box!.y + box!.height / 2
+    await orcaPage.mouse.move(startX, startY)
+    await orcaPage.mouse.down()
+    await orcaPage.mouse.move(startX - 350, startY, { steps: 40 })
+    await orcaPage.mouse.move(startX + 250, startY, { steps: 40 })
+    await orcaPage.mouse.up()
+    await orcaPage.waitForTimeout(500)
+
+    const paneContents = await readVisiblePaneContents(orcaPage)
+    for (const content of paneContents) {
+      const promptRedraws = content.match(/ISSUE2910_PROMPT/g)?.length ?? 0
+      const winchNotifications = content.match(/ISSUE2910_WINCH/g)?.length ?? 0
+      expect(promptRedraws).toBeLessThanOrEqual(3)
+      expect(winchNotifications).toBeLessThanOrEqual(1)
+    }
   })
 
   test('@headful dragging terminal panes around preserves leaf-keyed PTY bindings', async ({

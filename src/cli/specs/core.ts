@@ -91,14 +91,17 @@ export const CORE_COMMAND_SPECS: CommandSpec[] = [
     path: ['worktree', 'create'],
     summary: 'Create a new Orca-managed worktree',
     usage:
-      'orca worktree create --repo <selector> --name <name> [--base-branch <ref>] [--issue <number>] [--comment <text>] [--parent-worktree <selector>] [--no-parent] [--run-hooks] [--activate] [--json]',
+      'orca worktree create --name <name> [--repo <selector>] [--agent <id>] [--prompt <text>] [--setup run|skip|inherit] [--base-branch <ref>] [--issue <number>] [--comment <text>] [--parent-worktree <selector>] [--no-parent] [--run-hooks] [--activate] [--json]',
     allowedFlags: [
       ...GLOBAL_FLAGS,
       'repo',
       'name',
+      'agent',
+      'prompt',
       'base-branch',
       'issue',
       'comment',
+      'setup',
       'parent-worktree',
       'no-parent',
       'run-hooks',
@@ -106,26 +109,40 @@ export const CORE_COMMAND_SPECS: CommandSpec[] = [
     ],
     notes: [
       'By default, Orca records the new worktree as a child of the caller workspace when it can infer one from the Orca terminal or current directory.',
-      'Pass --parent-worktree to choose a parent explicitly, or --no-parent to force no lineage.',
+      'If --repo is omitted, Orca infers the repo from the current Orca-managed worktree.',
+      'For related work, use the inferred parent or pass --parent-worktree active to make the current workspace relationship explicit.',
+      'Use --no-parent when the new worktree should be independent of the current workspace.',
       'By default this creates the worktree and its first terminal without switching the active Orca workspace.',
-      'Repo-defined setup hooks follow the repository setup policy; pass --run-hooks to force them.',
+      'Pass --agent to launch an agent in the first terminal; --prompt sends initial work to that agent.',
+      'Repo-defined setup hooks follow the repository setup policy; pass --setup run to force them.',
       'Pass --activate when the CLI caller intentionally wants to reveal the new worktree in the app.',
-      'Passing --run-hooks reveals the worktree so the setup hook can run in its first terminal.'
+      'Passing --run-hooks is kept as a legacy alias for --setup run and reveals the worktree.'
+    ],
+    examples: [
+      'orca worktree create --name agent-task --agent codex --prompt "hi" --json',
+      'orca worktree create --repo id:<repoId> --name related-task --json',
+      'orca worktree create --repo id:<repoId> --name agent-task --agent codex --prompt "hi" --json',
+      'orca worktree create --repo id:<repoId> --name related-task --parent-worktree active --json',
+      'orca worktree create --repo id:<repoId> --name independent-task --no-parent --json'
     ]
   },
   {
     path: ['worktree', 'set'],
     summary: 'Update Orca metadata for a worktree',
     usage:
-      'orca worktree set --worktree <selector> [--display-name <name>] [--issue <number|null>] [--comment <text>] [--parent-worktree <selector>|--no-parent] [--json]',
+      'orca worktree set --worktree <selector> [--display-name <name>] [--issue <number|null>] [--comment <text>] [--workspace-status <id>] [--parent-worktree <selector>|--no-parent] [--json]',
     allowedFlags: [
       ...GLOBAL_FLAGS,
       'worktree',
       'display-name',
       'issue',
       'comment',
+      'workspace-status',
       'parent-worktree',
       'no-parent'
+    ],
+    notes: [
+      'Workspace status ids match the board columns (defaults: todo, in-progress, in-review, completed); custom statuses use their configured id.'
     ]
   },
   {
@@ -156,16 +173,17 @@ export const CORE_COMMAND_SPECS: CommandSpec[] = [
   {
     path: ['terminal', 'read'],
     summary: 'Read bounded terminal output',
-    usage: 'orca terminal read [--terminal <handle>] [--cursor <n>] [--json]',
-    allowedFlags: [...GLOBAL_FLAGS, 'terminal', 'cursor'],
+    usage: 'orca terminal read [--terminal <handle>] [--cursor <n>] [--limit <n>] [--json]',
+    allowedFlags: [...GLOBAL_FLAGS, 'terminal', 'cursor', 'limit'],
     notes: [
       'Omit --terminal to target the active terminal in the current worktree.',
       'Use --cursor with the nextCursor value from a previous read to get only new output since that read.',
+      'Use --limit to request more retained lines for long agent responses; output reports oldestCursor when older lines were dropped.',
       'Useful for capturing the response to a command: read before sending, then read --cursor <prev> after waiting.'
     ],
     examples: [
       'orca terminal read --json',
-      'orca terminal read --terminal term_abc123 --cursor 42 --json'
+      'orca terminal read --terminal term_abc123 --cursor 42 --limit 1000 --json'
     ]
   },
   {

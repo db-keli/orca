@@ -7,10 +7,12 @@ import { createTerminalSlice } from './slices/terminals'
 import { createTabsSlice } from './slices/tabs'
 import { createUISlice } from './slices/ui'
 import { createSettingsSlice } from './slices/settings'
+import { createKeybindingsSlice } from './slices/keybindings'
 import { createGitHubSlice } from './slices/github'
 import { createHostedReviewSlice } from './slices/hosted-review'
 import { createLinearSlice } from './slices/linear'
 import { createPreflightSlice } from './slices/preflight'
+import { createJiraSlice } from './slices/jira'
 import { createEditorSlice } from './slices/editor'
 import { createStatsSlice } from './slices/stats'
 import { createMemorySlice } from './slices/memory'
@@ -38,10 +40,12 @@ export const useAppStore = create<AppState>()((...a) => ({
   ...createTabsSlice(...a),
   ...createUISlice(...a),
   ...createSettingsSlice(...a),
+  ...createKeybindingsSlice(...a),
   ...createGitHubSlice(...a),
   ...createHostedReviewSlice(...a),
   ...createLinearSlice(...a),
   ...createPreflightSlice(...a),
+  ...createJiraSlice(...a),
   ...createEditorSlice(...a),
   ...createStatsSlice(...a),
   ...createMemorySlice(...a),

@@ -1,7 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { GlobalSettings } from '../../../../shared/types'
 import { getDefaultVoiceSettings } from '../../../../shared/constants'
-import type { SpeechModelManifest, SpeechModelState } from '../../../../shared/speech-types'
+import type { DeveloperPermissionRequestResult } from '../../../../shared/developer-permissions-types'
+import type { FeatureTipId } from '../../../../shared/feature-tips'
+import type {
+  SpeechModelManifest,
+  SpeechModelState,
+  VoiceSettings
+} from '../../../../shared/speech-types'
 import { Button } from '../ui/button'
 import { Label } from '../ui/label'
 import { Separator } from '../ui/separator'
@@ -14,13 +20,70 @@ import {
 import { Download, Trash2, Loader2, ChevronDown, Check } from 'lucide-react'
 import { toast } from 'sonner'
 import { useAppStore } from '@/store'
-
-const IS_MAC = navigator.userAgent.includes('Mac')
-const SHORTCUT_LABEL = IS_MAC ? '\u2318E' : 'Ctrl+E'
+import { useShortcutLabel } from '@/hooks/useShortcutLabel'
 
 type VoicePaneProps = {
   settings: GlobalSettings
   updateSettings: (updates: Partial<GlobalSettings>) => void
+}
+
+type VoiceDictationToggleOptions = {
+  voiceEnabled: boolean
+  markFeatureTipsSeen: (ids: FeatureTipId[]) => void
+  updateVoiceSettings: (updates: Partial<VoiceSettings>) => void
+  requestMicrophonePermission: () => Promise<DeveloperPermissionRequestResult>
+  setPermissionPending?: (pending: boolean) => void
+  isMounted?: () => boolean
+  notifyPermissionGranted?: () => void
+  notifyPermissionOpenedSystemSettings?: () => void
+  notifyPermissionRequired?: () => void
+  notifyPermissionRequestFailed?: () => void
+}
+
+export async function handleVoiceDictationToggle({
+  voiceEnabled,
+  markFeatureTipsSeen,
+  updateVoiceSettings,
+  requestMicrophonePermission,
+  setPermissionPending,
+  isMounted,
+  notifyPermissionGranted,
+  notifyPermissionOpenedSystemSettings,
+  notifyPermissionRequired,
+  notifyPermissionRequestFailed
+}: VoiceDictationToggleOptions): Promise<void> {
+  // Why: changing the Voice Dictation switch proves the user discovered the
+  // feature; disabling it later should not make the discovery modal eligible.
+  markFeatureTipsSeen(['voice-dictation'])
+
+  if (voiceEnabled) {
+    updateVoiceSettings({ enabled: false })
+    return
+  }
+
+  setPermissionPending?.(true)
+  try {
+    // Why: enabling dictation is the point where users expect the macOS
+    // microphone prompt, not after their first attempted recording fails.
+    const result = await requestMicrophonePermission()
+    if (result.status === 'granted' || result.status === 'unsupported') {
+      updateVoiceSettings({ enabled: true })
+    }
+
+    if (result.status === 'granted') {
+      notifyPermissionGranted?.()
+    } else if (result.openedSystemSettings) {
+      notifyPermissionOpenedSystemSettings?.()
+    } else if (result.status !== 'unsupported') {
+      notifyPermissionRequired?.()
+    }
+  } catch {
+    notifyPermissionRequestFailed?.()
+  } finally {
+    if (isMounted?.() ?? true) {
+      setPermissionPending?.(false)
+    }
+  }
 }
 
 export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.JSX.Element {
@@ -31,15 +94,32 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   const voiceSettings = settings.voice ?? getDefaultVoiceSettings()
   const modelStates = useAppStore((s) => s.modelStates)
   const refreshModelStates = useAppStore((s) => s.refreshModelStates)
+  const markFeatureTipsSeen = useAppStore((s) => s.markFeatureTipsSeen)
+  const shortcutLabel = useShortcutLabel('voice.dictation')
   const [catalog, setCatalog] = useState<SpeechModelManifest[]>([])
   const [permissionPending, setPermissionPending] = useState(false)
+  const mountedRef = useRef(true)
+
+  const handlePaneRef = useCallback((node: HTMLDivElement | null): void => {
+    // Why: the microphone permission prompt can resolve after Settings closes;
+    // the pane ref gives that completion a stale-write guard without an Effect.
+    mountedRef.current = node !== null
+  }, [])
 
   useEffect(() => {
+    let cancelled = false
     refreshModelStates()
-    window.api.speech
+    void window.api.speech
       .getCatalog()
-      .then(setCatalog)
+      .then((nextCatalog) => {
+        if (!cancelled) {
+          setCatalog(nextCatalog)
+        }
+      })
       .catch(() => {})
+    return () => {
+      cancelled = true
+    }
   }, [refreshModelStates])
 
   useEffect(() => {
@@ -49,7 +129,7 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
     return cleanup
   }, [refreshModelStates])
 
-  const updateVoiceSettings = (updates: Partial<GlobalSettings['voice']>): void => {
+  const updateVoiceSettings = (updates: Partial<VoiceSettings>): void => {
     updateSettings({
       voice: {
         ...voiceSettings,
@@ -59,34 +139,24 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   }
 
   const toggleVoiceDictation = async (): Promise<void> => {
-    if (voiceSettings.enabled) {
-      updateVoiceSettings({ enabled: false })
-      return
-    }
-
-    setPermissionPending(true)
-    try {
-      // Why: enabling dictation is the point where users expect the macOS
-      // microphone prompt, not after their first attempted recording fails.
-      const result = await window.api.developerPermissions.request({ id: 'microphone' })
-      if (result.status === 'granted' || result.status === 'unsupported') {
-        updateVoiceSettings({ enabled: true })
-      }
-
-      if (result.status === 'granted') {
-        toast.success('Microphone permission granted')
-      } else if (result.openedSystemSettings) {
+    await handleVoiceDictationToggle({
+      voiceEnabled: voiceSettings.enabled,
+      markFeatureTipsSeen,
+      updateVoiceSettings,
+      requestMicrophonePermission: () =>
+        window.api.developerPermissions.request({ id: 'microphone' }),
+      setPermissionPending,
+      isMounted: () => mountedRef.current,
+      notifyPermissionGranted: () => toast.success('Microphone permission granted'),
+      notifyPermissionOpenedSystemSettings: () =>
         toast.message(
           'Opened macOS Privacy & Security. Enable dictation again after granting access.'
-        )
-      } else if (result.status !== 'unsupported') {
-        toast.message('Microphone permission is required before enabling voice dictation.')
-      }
-    } catch {
-      toast.error('Could not request microphone permission. Voice dictation was not enabled.')
-    } finally {
-      setPermissionPending(false)
-    }
+        ),
+      notifyPermissionRequired: () =>
+        toast.message('Microphone permission is required before enabling voice dictation.'),
+      notifyPermissionRequestFailed: () =>
+        toast.error('Could not request microphone permission. Voice dictation was not enabled.')
+    })
   }
 
   const getModelState = (id: string): SpeechModelState | undefined =>
@@ -99,12 +169,12 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
   const selectedIsReady = selectedModelState?.status === 'ready'
 
   return (
-    <div className="space-y-1">
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+    <div ref={handlePaneRef} className="space-y-1">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Enable Voice Dictation</Label>
           <p className="text-xs text-muted-foreground">
-            Press {SHORTCUT_LABEL} to dictate text into any focused pane.
+            Press {shortcutLabel} to dictate text into any focused pane.
           </p>
         </div>
         <button
@@ -128,12 +198,12 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
 
       <Separator />
 
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Dictation Mode</Label>
           <p className="text-xs text-muted-foreground">
-            Toggle: press {SHORTCUT_LABEL} once to start, again to stop. Hold: dictate while{' '}
-            {SHORTCUT_LABEL} is held.
+            Toggle: press {shortcutLabel} once to start, again to stop. Hold: dictate while{' '}
+            {shortcutLabel} is held.
           </p>
         </div>
         <div className="flex shrink-0 items-center rounded-md border border-border/60 bg-background/50 p-0.5">
@@ -156,7 +226,7 @@ export function VoicePane({ settings, updateSettings }: VoicePaneProps): React.J
 
       <Separator />
 
-      <div className="flex items-center justify-between gap-4 px-1 py-2">
+      <div className="flex items-center justify-between gap-4 py-2">
         <div className="space-y-0.5">
           <Label>Speech Model</Label>
           <p className="text-xs text-muted-foreground">

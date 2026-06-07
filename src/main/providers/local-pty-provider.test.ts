@@ -38,7 +38,20 @@ vi.mock('node-pty', () => ({
 }))
 
 vi.mock('../wsl', () => ({
-  parseWslPath: () => null
+  parseWslPath: (path: string) => {
+    const match = path.match(/^\\\\wsl\.localhost\\([^\\]+)(.*)$/)
+    if (!match) {
+      return null
+    }
+    return {
+      distro: match[1],
+      linuxPath: (match[2] || '').replace(/\\/g, '/') || '/'
+    }
+  },
+  toLinuxPath: (path: string) => path.replace(/^C:\\/i, '/mnt/c/').replace(/\\/g, '/'),
+  toWindowsWslPath: (path: string, distro: string) =>
+    `\\\\wsl.localhost\\${distro}${path.replace(/\//g, '\\')}`,
+  isWslAvailable: () => true
 }))
 
 import { LocalPtyProvider } from './local-pty-provider'
@@ -56,8 +69,11 @@ describe('LocalPtyProvider', () => {
   }
   let exitCb: ((info: { exitCode: number }) => void) | undefined
   let origShell: string | undefined
+  let origPlatform: PropertyDescriptor | undefined
 
   beforeEach(() => {
+    origPlatform = Object.getOwnPropertyDescriptor(process, 'platform')
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' })
     origShell = process.env.SHELL
     process.env.SHELL = '/bin/zsh'
 
@@ -87,6 +103,9 @@ describe('LocalPtyProvider', () => {
   })
 
   afterEach(() => {
+    if (origPlatform) {
+      Object.defineProperty(process, 'platform', origPlatform)
+    }
     if (origShell === undefined) {
       delete process.env.SHELL
     } else {
@@ -99,6 +118,28 @@ describe('LocalPtyProvider', () => {
       const result = await provider.spawn({ cols: 80, rows: 24 })
       expect(result.id).toBeTruthy()
       expect(typeof result.id).toBe('string')
+    })
+
+    it('reattaches to an existing caller-supplied session id without spawning', async () => {
+      const first = await provider.spawn({ cols: 80, rows: 24, sessionId: 'serve-session-1' })
+      spawnMock.mockClear()
+
+      const second = await provider.spawn({ cols: 120, rows: 40, sessionId: first.id })
+
+      expect(second).toEqual({ id: 'serve-session-1', pid: 12345, isReattach: true })
+      expect(mockProc.resize).toHaveBeenCalledWith(120, 40)
+      expect(spawnMock).not.toHaveBeenCalled()
+    })
+
+    it('does not reattach numeric caller session ids that can collide after restart', async () => {
+      const first = await provider.spawn({ cols: 80, rows: 24 })
+      spawnMock.mockClear()
+
+      const second = await provider.spawn({ cols: 120, rows: 40, sessionId: first.id })
+
+      expect(second.id).not.toBe(first.id)
+      expect(second.isReattach).toBeUndefined()
+      expect(spawnMock).toHaveBeenCalledOnce()
     })
 
     it('calls node-pty spawn with correct args', async () => {
@@ -138,6 +179,188 @@ describe('LocalPtyProvider', () => {
 
       const spawnCall = spawnMock.mock.calls.at(-1)!
       expect(spawnCall[2].env.CUSTOM_VAR).toBe('custom-value')
+    })
+
+    it('does not pass a Windows Codex home into WSL terminals', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      provider.configure({
+        buildSpawnEnv: (_id, env) => {
+          env.CODEX_HOME = 'C:\\Users\\jin\\.codex'
+          env.ORCA_CODEX_HOME = 'C:\\Users\\jin\\.codex'
+          return env
+        }
+      })
+
+      await provider.spawn({
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo'
+      })
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[0]).toBe('wsl.exe')
+      expect(spawnCall[2].env.CODEX_HOME).toBeUndefined()
+      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBeUndefined()
+    })
+
+    it('does not pass a WSL managed Codex home into Windows terminals', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      provider.configure({
+        buildSpawnEnv: (_id, env) => {
+          env.CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+          env.ORCA_CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+          return env
+        }
+      })
+
+      await provider.spawn({
+        cols: 80,
+        rows: 24,
+        cwd: 'C:\\Users\\jin\\repo'
+      })
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[2].env.CODEX_HOME).toBeUndefined()
+      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBeUndefined()
+    })
+
+    it('preserves an explicit Linux Codex home for WSL terminals', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      provider.configure({
+        buildSpawnEnv: (_id, env) => {
+          env.CODEX_HOME = '/home/jin/.codex-alt'
+          return env
+        }
+      })
+
+      await provider.spawn({
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo'
+      })
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[0]).toBe('wsl.exe')
+      expect(spawnCall[2].env.CODEX_HOME).toBe('/home/jin/.codex-alt')
+      expect(spawnCall[2].env.WSLENV).toContain('CODEX_HOME')
+    })
+
+    it('translates a WSL managed Codex home before launching a WSL terminal', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      provider.configure({
+        buildSpawnEnv: (_id, env) => {
+          env.CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+          env.ORCA_CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+          return env
+        }
+      })
+
+      await provider.spawn({
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo'
+      })
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[0]).toBe('wsl.exe')
+      expect(spawnCall[2].env.CODEX_HOME).toBe('/home/jin/.local/share/orca/codex-accounts/a/home')
+      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBe(
+        '/home/jin/.local/share/orca/codex-accounts/a/home'
+      )
+      expect(spawnCall[2].env.WSLENV).toContain('CODEX_HOME')
+      expect(spawnCall[2].env.WSLENV).toContain('ORCA_CODEX_HOME')
+    })
+
+    it('does not pass a WSL managed Codex home into a different WSL distro', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      provider.configure({
+        buildSpawnEnv: (_id, env) => {
+          env.CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+          env.ORCA_CODEX_HOME =
+            '\\\\wsl.localhost\\Ubuntu\\home\\jin\\.local\\share\\orca\\codex-accounts\\a\\home'
+          return env
+        }
+      })
+
+      await provider.spawn({
+        cols: 80,
+        rows: 24,
+        cwd: '\\\\wsl.localhost\\Debian\\home\\jin\\repo'
+      })
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[0]).toBe('wsl.exe')
+      expect(spawnCall[2].env.CODEX_HOME).toBeUndefined()
+      expect(spawnCall[2].env.ORCA_CODEX_HOME).toBeUndefined()
+    })
+
+    it('uses the preferred WSL distro for Windows cwd WSL terminals', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+
+      await provider.spawn({
+        cols: 80,
+        rows: 24,
+        cwd: 'C:\\Users\\jin\\repo',
+        shellOverride: 'wsl.exe',
+        terminalWindowsWslDistro: 'Debian'
+      })
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[0]).toBe('wsl.exe')
+      expect(spawnCall[1]).toEqual([
+        '-d',
+        'Debian',
+        '--',
+        'bash',
+        '-c',
+        'cd \'/mnt/c/Users/jin/repo\' && export PATH="$HOME/.local/bin:$PATH" && exec bash -l'
+      ])
+    })
+
+    it('marks Orca terminal handle for WSL import when buildSpawnEnv opts in', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      const savedCodexHome = process.env.CODEX_HOME
+      const savedOrcaCodexHome = process.env.ORCA_CODEX_HOME
+      delete process.env.CODEX_HOME
+      delete process.env.ORCA_CODEX_HOME
+      provider.configure({
+        buildSpawnEnv: (_id, env, ctx) => {
+          env.ORCA_TERMINAL_HANDLE = 'term_wsl'
+          if (ctx?.isWsl) {
+            env.WSLENV = 'ORCA_TERMINAL_HANDLE/u'
+          }
+          return env
+        }
+      })
+
+      try {
+        await provider.spawn({
+          cols: 80,
+          rows: 24,
+          cwd: '\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo'
+        })
+      } finally {
+        if (savedCodexHome === undefined) {
+          delete process.env.CODEX_HOME
+        } else {
+          process.env.CODEX_HOME = savedCodexHome
+        }
+        if (savedOrcaCodexHome === undefined) {
+          delete process.env.ORCA_CODEX_HOME
+        } else {
+          process.env.ORCA_CODEX_HOME = savedOrcaCodexHome
+        }
+      }
+
+      const spawnCall = spawnMock.mock.calls.at(-1)!
+      expect(spawnCall[0]).toBe('wsl.exe')
+      expect(spawnCall[2].env.ORCA_TERMINAL_HANDLE).toBe('term_wsl')
+      expect(spawnCall[2].env.WSLENV).toBe('ORCA_TERMINAL_HANDLE/u')
     })
 
     it('does not inherit parent Orca pane identity when caller omits pane env', async () => {
@@ -244,6 +467,75 @@ describe('LocalPtyProvider', () => {
         expect.objectContaining({ cwd: 'D:\\Users\\orca' })
       )
     })
+
+    it('launches POSIX cwd split panes through WSL when worktree context is WSL', async () => {
+      const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+      Object.defineProperty(process, 'platform', { value: 'win32' })
+
+      try {
+        await provider.spawn({
+          cols: 80,
+          rows: 24,
+          cwd: '/home/jin/repo/subdir',
+          shellOverride: 'powershell.exe',
+          worktreeId: 'repo::\\\\wsl.localhost\\Ubuntu\\home\\jin\\repo'
+        })
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, 'platform', platform)
+        }
+      }
+
+      expect(spawnMock).toHaveBeenCalledWith(
+        'wsl.exe',
+        [
+          '-d',
+          'Ubuntu',
+          '--',
+          'bash',
+          '-c',
+          'cd \'/home/jin/repo/subdir\' && export PATH="$HOME/.local/bin:$PATH" && exec bash -l'
+        ],
+        expect.objectContaining({ cwd: expect.any(String) })
+      )
+    })
+
+    it('resolves the Git Bash default shell and preserves the requested cwd', async () => {
+      const platform = Object.getOwnPropertyDescriptor(process, 'platform')
+      const originalProgramFiles = process.env.ProgramFiles
+      Object.defineProperty(process, 'platform', { value: 'win32' })
+      process.env.ProgramFiles = 'C:\\Program Files'
+      provider.configure({ getWindowsShell: () => 'git-bash' })
+
+      try {
+        await provider.spawn({
+          cols: 80,
+          rows: 24,
+          cwd: 'C:\\Users\\jin\\repo'
+        })
+      } finally {
+        if (platform) {
+          Object.defineProperty(process, 'platform', platform)
+        }
+        if (originalProgramFiles === undefined) {
+          delete process.env.ProgramFiles
+        } else {
+          process.env.ProgramFiles = originalProgramFiles
+        }
+      }
+
+      expect(spawnMock).toHaveBeenCalledWith(
+        'C:\\Program Files\\Git\\bin\\bash.exe',
+        ['--login', '-i'],
+        expect.objectContaining({
+          cwd: 'C:\\Users\\jin\\repo',
+          env: expect.objectContaining({
+            CHERE_INVOKING: '1',
+            PYTHONUTF8: '1'
+          })
+        })
+      )
+    })
   })
 
   describe('write', () => {
@@ -285,6 +577,25 @@ describe('LocalPtyProvider', () => {
       const { id } = await provider.spawn({ cols: 80, rows: 24 })
       await provider.shutdown(id, { immediate: true })
       expect(onExit).toHaveBeenCalledWith(id, -1)
+    })
+
+    it('does not destroy after an intentional Windows shutdown kill', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      const killSpy = vi.fn()
+      const destroySpy = vi.fn(() => {
+        killSpy()
+      })
+      spawnMock.mockReturnValue({
+        ...mockProc,
+        kill: killSpy,
+        destroy: destroySpy
+      })
+
+      const { id } = await provider.spawn({ cols: 80, rows: 24 })
+      await provider.shutdown(id, { immediate: true })
+
+      expect(killSpy).toHaveBeenCalledTimes(1)
+      expect(destroySpy).not.toHaveBeenCalled()
     })
 
     it('is a no-op for unknown PTY ids', async () => {
@@ -425,6 +736,24 @@ describe('LocalPtyProvider', () => {
       expect(mock2Kill).toHaveBeenCalled()
       const list = await provider.listProcesses()
       expect(list).toHaveLength(0)
+    })
+
+    it('does not destroy after intentional Windows orphan kills', async () => {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' })
+      const destroySpy = vi.fn()
+      const killSpy = vi.fn()
+      spawnMock.mockReturnValue({
+        ...mockProc,
+        kill: killSpy,
+        destroy: destroySpy
+      })
+
+      await provider.spawn({ cols: 80, rows: 24 })
+
+      provider.killAll()
+
+      expect(killSpy).toHaveBeenCalledTimes(1)
+      expect(destroySpy).not.toHaveBeenCalled()
     })
   })
 })

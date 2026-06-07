@@ -2,11 +2,17 @@ import { useAppStore } from '@/store'
 import { pasteDraftWhenAgentReady } from '@/lib/agent-paste-draft'
 import {
   inspectRuntimeTerminalProcess,
-  sendRuntimePtyInput
+  sendRuntimePtyInputVerified
 } from '@/runtime/runtime-terminal-inspection'
 import type { AgentStartupPlan } from '@/lib/tui-agent-startup'
 import { isShellProcess } from '@/lib/tui-agent-startup'
+import type { LinkedWorkItemContext } from '@/lib/linked-work-item-context'
 import type { OrcaHooks, TaskViewPresetId } from '../../../shared/types'
+import { resolveHookCommandSourcePolicy } from '../../../shared/hook-command-source-policy'
+import { isExpectedAgentProcess } from '../../../shared/agent-process-recognition'
+import { slugifyForWorkspaceName } from '../../../shared/workspace-name'
+export { getLinkedWorkItemSuggestedName } from '../../../shared/workspace-name'
+export { getWorkspaceIntentName } from '../../../shared/workspace-name'
 
 /**
  * Why: the TaskPage's preset buttons and the openTaskPage prefetcher both need
@@ -29,30 +35,29 @@ export function getTaskPresetQuery(presetId: TaskViewPresetId | null): string {
       return 'author:@me is:pr is:open'
     case 'review':
       return 'review-requested:@me is:pr is:open'
-    default:
+    case null:
       return 'is:issue is:open'
   }
 }
 
-export const IS_MAC = navigator.userAgent.includes('Mac')
-export const ADD_ATTACHMENT_SHORTCUT = IS_MAC ? '⌘U' : 'Ctrl+U'
 export const CLIENT_PLATFORM: NodeJS.Platform = navigator.userAgent.includes('Windows')
   ? 'win32'
-  : IS_MAC
+  : navigator.userAgent.includes('Mac')
     ? 'darwin'
     : 'linux'
 
+export type { LinkedWorkItemContext } from '@/lib/linked-work-item-context'
+export { getLinkedWorkItemProvider, isGitLabIssueUrl } from './linked-work-item-provider'
+
 export type LinkedWorkItemSummary = {
-  /** 'mr' is the GitLab analogue of 'pr'. The shape is otherwise
-   *  identical so the linked-work-item badge in the composer renders
-   *  uniformly across providers. */
   type: 'issue' | 'pr' | 'mr'
+  provider?: 'github' | 'gitlab' | 'linear' | 'jira'
   number: number
   title: string
   url: string
-  /** Linear identifier (for example ENG-123) when this linked item came from
-   *  Linear rather than GitHub. */
   linearIdentifier?: string
+  jiraIdentifier?: string
+  linkedContext?: LinkedWorkItemContext
 }
 
 // Why: when a repo has no `orca.yaml` issueCommand and no per-user override,
@@ -60,6 +65,39 @@ export type LinkedWorkItemSummary = {
 // attaches a linked work item without typing anything else. "Complete <url>"
 // is the minimum viable instruction that always produces a coherent agent task.
 export const DEFAULT_ISSUE_COMMAND_TEMPLATE = 'Complete {{artifact_url}}'
+
+export type SetupConfig = {
+  source: 'yaml' | 'local' | 'both'
+  command: string
+  kind: 'setup' | 'default-tabs' | 'setup-and-default-tabs'
+}
+
+function getDefaultTabCommandPreview(yamlHooks: OrcaHooks | null): string {
+  return (yamlHooks?.defaultTabs ?? [])
+    .map((tab, index) => {
+      const command = tab.command?.trim()
+      if (!command) {
+        return null
+      }
+      const label = tab.title ? ` ${tab.title}` : ''
+      return `# defaultTabs[${index + 1}]${label}\n${command}`
+    })
+    .filter((entry): entry is string => entry !== null)
+    .join('\n\n')
+}
+
+function getSetupConfigKind(
+  hasSetup: boolean,
+  hasDefaultTabCommands: boolean
+): SetupConfig['kind'] {
+  if (hasSetup && hasDefaultTabCommands) {
+    return 'setup-and-default-tabs'
+  }
+  if (hasDefaultTabCommands) {
+    return 'default-tabs'
+  }
+  return 'setup'
+}
 
 /**
  * Substitute the issue-command template variables. Prefers `{{artifact_url}}`
@@ -84,10 +122,11 @@ export function renderIssueCommandTemplate(
 export function buildAgentPromptWithContext(
   prompt: string,
   attachments: string[],
-  linkedUrls: string[]
+  linkedUrls: string[],
+  linkedContextBlocks: string[] = []
 ): string {
   const trimmedPrompt = prompt.trim()
-  if (attachments.length === 0 && linkedUrls.length === 0) {
+  if (attachments.length === 0 && linkedUrls.length === 0 && linkedContextBlocks.length === 0) {
     return trimmedPrompt
   }
 
@@ -100,9 +139,12 @@ export function buildAgentPromptWithContext(
     const linkBlock = linkedUrls.map((url) => `- ${url}`).join('\n')
     sections.push(`Linked work items:\n${linkBlock}`)
   }
+  if (linkedContextBlocks.length > 0) {
+    sections.push(linkedContextBlocks.join('\n\n'))
+  }
   // Why: the new-workspace flow launches each agent with a single plain-text
-  // startup prompt. Appending attachments and linked URLs keeps extra context
-  // visible to Claude/Codex/OpenCode without cluttering the visible textarea.
+  // startup prompt. Appending attachments and bounded linked context keeps
+  // extra data visible to Claude/Codex/OpenCode without cluttering the textarea.
   if (!trimmedPrompt) {
     return sections.join('\n\n')
   }
@@ -115,55 +157,44 @@ export function getAttachmentLabel(pathValue: string): string {
 }
 
 export function getSetupConfig(
-  repo: { hookSettings?: { scripts?: { setup?: string } } } | undefined,
+  repo:
+    | {
+        hookSettings?: {
+          commandSourcePolicy?: unknown
+          scripts?: { setup?: string }
+        }
+      }
+    | undefined,
   yamlHooks: OrcaHooks | null
-): { source: 'yaml' | 'legacy'; command: string } | null {
+): SetupConfig | null {
   const yamlSetup = yamlHooks?.scripts?.setup?.trim()
-  if (yamlSetup) {
-    return { source: 'yaml', command: yamlSetup }
+  const yamlDefaultTabCommands = getDefaultTabCommandPreview(yamlHooks)
+  const localSetup = repo?.hookSettings?.scripts?.setup?.trim()
+  const sourcePolicy = resolveHookCommandSourcePolicy(repo?.hookSettings?.commandSourcePolicy, {
+    hasLocalScript: Boolean(localSetup)
+  })
+
+  if (sourcePolicy === 'local-only') {
+    return localSetup ? { source: 'local', command: localSetup, kind: 'setup' } : null
   }
-  const legacySetup = repo?.hookSettings?.scripts?.setup?.trim()
-  if (legacySetup) {
-    return { source: 'legacy', command: legacySetup }
+
+  const yamlCommand = [yamlSetup, yamlDefaultTabCommands].filter(Boolean).join('\n\n')
+  if (sourcePolicy === 'run-both' && yamlCommand && localSetup) {
+    return {
+      source: 'both',
+      command: `${yamlCommand}\n\n${localSetup}`,
+      kind: getSetupConfigKind(true, Boolean(yamlDefaultTabCommands))
+    }
+  }
+
+  if (yamlCommand) {
+    return {
+      source: 'yaml',
+      command: yamlCommand,
+      kind: getSetupConfigKind(Boolean(yamlSetup), Boolean(yamlDefaultTabCommands))
+    }
   }
   return null
-}
-
-// Why: branch names and on-disk worktree directories must be short, lowercase,
-// and ASCII-safe. Free-form text (prompts, GitHub titles) often contains
-// emoji, CJK, or hundreds of characters, which would otherwise make
-// sanitizeWorktreeName either produce a ludicrously long name or throw
-// "Invalid worktree name" when every character is stripped.
-function slugifyForWorkspaceName(input: string): string {
-  return (
-    input
-      .trim()
-      .toLowerCase()
-      .replace(/[\\/]+/g, '-')
-      .replace(/\s+/g, '-')
-      .replace(/[^a-z0-9._-]+/g, '-')
-      .replace(/-+/g, '-')
-      // Why: git check-ref-format rejects any ref containing `..`, so a prompt
-      // like "../../foo" must not turn into a branch seed with internal `..`
-      // sequences (the main-process sanitizer collapses these too, but we
-      // mirror the rule here so the renderer preview matches the real name).
-      .replace(/\.{2,}/g, '.')
-      .replace(/^[.-]+|[.-]+$/g, '')
-      .slice(0, 48)
-      .replace(/[-._]+$/g, '')
-  )
-}
-
-export function getLinkedWorkItemSuggestedName(item: { title: string }): string {
-  const withoutLeadingNumber = item.title
-    .trim()
-    .replace(/^(?:issue|pr|pull request)\s*#?\d+\s*[:-]\s*/i, '')
-    .replace(/^#\d+\s*[:-]\s*/, '')
-    .replace(/\(#\d+\)/gi, '')
-    .replace(/\b#\d+\b/g, '')
-    .trim()
-  const seed = withoutLeadingNumber || item.title.trim()
-  return slugifyForWorkspaceName(seed)
 }
 
 export function getWorkspaceSeedName(args: {
@@ -207,15 +238,12 @@ export function getWorkspaceSeedName(args: {
   return 'workspace'
 }
 
-// Why: bracketed paste markers and ready-wait grace timing live in
-// agent-paste-draft.ts so the new-workspace and "Use" flows share one
-// definition of "type into the agent's input as a non-submitted draft".
-
 export async function ensureAgentStartupInTerminal(args: {
   worktreeId: string
+  primaryTabId?: string | null
   startup: AgentStartupPlan
 }): Promise<void> {
-  const { worktreeId, startup } = args
+  const { worktreeId, primaryTabId, startup } = args
   const draftPrompt = startup.draftPrompt ?? null
   if (startup.followupPrompt === null && draftPrompt === null) {
     return
@@ -231,8 +259,14 @@ export async function ensureAgentStartupInTerminal(args: {
       await new Promise((resolve) => window.setTimeout(resolve, 150))
     }
     const state = useAppStore.getState()
+    // Why: workspace activation tells us the exact tab that received the agent
+    // startup command. Use it for draft paste instead of re-deriving from
+    // active tab state, which can move while setup/background panes mount.
     tabId =
-      state.activeTabIdByWorktree[worktreeId] ?? state.tabsByWorktree[worktreeId]?.[0]?.id ?? null
+      primaryTabId ??
+      state.activeTabIdByWorktree[worktreeId] ??
+      state.tabsByWorktree[worktreeId]?.[0]?.id ??
+      null
     if (!tabId) {
       continue
     }
@@ -250,7 +284,7 @@ export async function ensureAgentStartupInTerminal(args: {
   // session and submitted. Wait until the agent owns the PTY before writing.
   if (startup.followupPrompt) {
     await waitForAgentForeground(ptyId, startup.expectedProcess)
-    sendRuntimePtyInput(useAppStore.getState().settings, ptyId, `${startup.followupPrompt}\r`)
+    await sendFollowupPrompt(ptyId, startup.followupPrompt)
   }
 
   // Why: draftPrompt uses bracketed-paste so the URL lands atomically in the
@@ -262,6 +296,14 @@ export async function ensureAgentStartupInTerminal(args: {
       content: draftPrompt,
       agent: startup.agent
     })
+  }
+}
+
+async function sendFollowupPrompt(ptyId: string, prompt: string): Promise<boolean> {
+  try {
+    return await sendRuntimePtyInputVerified(useAppStore.getState().settings, ptyId, `${prompt}\r`)
+  } catch {
+    return false
   }
 }
 
@@ -277,11 +319,7 @@ async function waitForAgentForeground(ptyId: string, expectedProcess: string): P
     try {
       const process = await inspectRuntimeTerminalProcess(useAppStore.getState().settings, ptyId)
       const foreground = process.foregroundProcess?.toLowerCase() ?? ''
-      const owns =
-        foreground === expectedProcess ||
-        foreground.startsWith(`${expectedProcess}.`) ||
-        foreground.endsWith(`/${expectedProcess}`)
-      if (owns) {
+      if (isExpectedAgentProcess(foreground, expectedProcess)) {
         return
       }
       if (attempt >= 4 && !isShellProcess(foreground)) {

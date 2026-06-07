@@ -1,36 +1,38 @@
-/**
- * Step for AddRepoDialog (orca#763).
- *
- * Split from AddRepoDialog and AddRepoSteps to keep both under the 400-line
- * oxlint limit, following the same pattern as useRemoteRepo.
- */
-
+// Step for AddRepoDialog (orca#763), split out so create-project state stays scoped.
 import React, { useCallback, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { Folder, GitBranch, Home, Pencil } from 'lucide-react'
+import { Folder, GitBranch } from 'lucide-react'
 import { useAppStore } from '@/store'
+import { useMountedRef } from '@/hooks/useMountedRef'
 import { DialogHeader, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { activateAndRevealWorktree } from '@/lib/worktree-activation'
+import { markOnboardingProjectAdded } from '@/lib/onboarding-project-checklist'
 import { callRuntimeRpc, getActiveRuntimeTarget } from '@/runtime/runtime-rpc-client'
 import { isGitRepoKind } from '../../../../shared/repo-kind'
 import type { Repo } from '../../../../shared/types'
+import {
+  CreateProjectLocationField,
+  CreateProjectParentBrowser
+} from './CreateProjectLocationField'
 
-type DialogStep = 'add' | 'clone' | 'remote' | 'create' | 'setup'
 type RepoKind = 'git' | 'folder'
 
 export function useCreateRepo(
-  fetchWorktrees: (repoId: string) => Promise<void>,
-  setStep: (step: DialogStep) => void,
-  setAddedRepo: (repo: Repo | null) => void,
-  closeModal: () => void
+  fetchWorktrees: (
+    repoId: string,
+    options?: { requireAuthoritative?: boolean }
+  ) => Promise<boolean>,
+  closeModal: () => void,
+  onGitRepoReady?: (repoId: string) => void | Promise<void>
 ) {
   const [createName, setCreateName] = useState('')
   const [createParent, setCreateParent] = useState('')
   const [createKind, setCreateKind] = useState<RepoKind>('git')
   const [createError, setCreateError] = useState<string | null>(null)
   const [isCreating, setIsCreating] = useState(false)
+  const mountedRef = useMountedRef()
 
   // Why: monotonic ID so stale create callbacks can detect they were superseded
   // when the user clicks Back or closes the dialog mid-create. Mirrors the
@@ -53,12 +55,13 @@ export function useCreateRepo(
       toast.error('Enter a server parent path.')
       return
     }
+    const gen = createGenRef.current
     const dir = await window.api.repos.pickDirectory()
-    if (dir) {
+    if (dir && gen === createGenRef.current && mountedRef.current) {
       setCreateParent(dir)
       setCreateError(null)
     }
-  }, [])
+  }, [mountedRef])
 
   const handleCreate = useCallback(async () => {
     const name = createName.trim()
@@ -70,8 +73,7 @@ export function useCreateRepo(
     setIsCreating(true)
     setCreateError(null)
     try {
-      const settings = useAppStore.getState().settings
-      const target = getActiveRuntimeTarget(settings)
+      const target = getActiveRuntimeTarget(useAppStore.getState().settings)
       const result =
         target.kind === 'environment'
           ? await callRuntimeRpc<{ repo: Repo } | { error: string }>(
@@ -91,7 +93,7 @@ export function useCreateRepo(
             })
       // Why: if the user closed the dialog or clicked Back mid-create,
       // createGenRef was bumped by resetCreateState. Ignore stale results.
-      if (gen !== createGenRef.current) {
+      if (gen !== createGenRef.current || !mountedRef.current) {
         return
       }
       if ('error' in result) {
@@ -125,41 +127,41 @@ export function useCreateRepo(
         })
       }
       if (isGitRepoKind(repo)) {
-        // Why: setAddedRepo only drives the git "setup" step; the folder
-        // branch closes the dialog, which resets addedRepo to null anyway.
-        setAddedRepo(repo)
-        await fetchWorktrees(repo.id)
-        if (gen !== createGenRef.current) {
+        // Why: Git repos use the shared default-checkout completion path.
+        // Why: if refresh is temporarily non-authoritative, the shared opener
+        // still reveals the project so the user is not left in a completed add flow.
+        await fetchWorktrees(repo.id, { requireAuthoritative: true })
+        if (gen !== createGenRef.current || !mountedRef.current) {
           return
         }
-        setStep('setup')
+        await onGitRepoReady?.(repo.id)
       } else {
-        // Why: without activating the new folder, the dialog closes and users
-        // see no change. Matches addNonGitFolder's behavior in the store slice.
+        // Why: folder repos skip the Git default-checkout handoff, so activate the synthetic
+        // root workspace before closing. Matches addNonGitFolder's behavior.
         await fetchWorktrees(repo.id)
-        if (gen !== createGenRef.current) {
+        if (gen !== createGenRef.current || !mountedRef.current) {
           return
         }
         const folderWorktree = useAppStore.getState().worktreesByRepo[repo.id]?.[0]
         if (folderWorktree) {
-          activateAndRevealWorktree(folderWorktree.id)
+          activateAndRevealWorktree(folderWorktree.id, { sidebarRevealBehavior: 'auto' })
         }
+        await markOnboardingProjectAdded('addedFolder')
         closeModal()
       }
     } catch (err) {
-      if (gen !== createGenRef.current) {
+      if (gen !== createGenRef.current || !mountedRef.current) {
         return
       }
-      const message = err instanceof Error ? err.message : String(err)
-      setCreateError(message)
+      setCreateError(err instanceof Error ? err.message : String(err))
     } finally {
       // Why: only clear the loading state if this invocation is still current;
       // a superseded create must not flip the flag back off for a new flow.
-      if (gen === createGenRef.current) {
+      if (gen === createGenRef.current && mountedRef.current) {
         setIsCreating(false)
       }
     }
-  }, [createName, createParent, createKind, fetchWorktrees, setStep, setAddedRepo, closeModal])
+  }, [createName, createParent, createKind, fetchWorktrees, mountedRef, closeModal, onGitRepoReady])
 
   return {
     createName,
@@ -258,6 +260,7 @@ type CreateStepProps = {
   createError: string | null
   isCreating: boolean
   manualParentEntry?: boolean
+  runtimeEnvironmentId?: string | null
   onNameChange: (value: string) => void
   onParentChange: (value: string) => void
   onKindChange: (kind: RepoKind) => void
@@ -272,6 +275,7 @@ export function CreateStep({
   createError,
   isCreating,
   manualParentEntry = false,
+  runtimeEnvironmentId,
   onNameChange,
   onParentChange,
   onKindChange,
@@ -279,21 +283,54 @@ export function CreateStep({
   onCreate
 }: CreateStepProps): React.JSX.Element {
   const radioGroupRef = useRef<HTMLDivElement>(null)
+  const radioFocusFrameRef = useRef<number | null>(null)
+  const [browsingParent, setBrowsingParent] = useState(false)
+
+  const cancelRadioFocusFrame = useCallback((): void => {
+    if (radioFocusFrameRef.current === null) {
+      return
+    }
+    cancelAnimationFrame(radioFocusFrameRef.current)
+    radioFocusFrameRef.current = null
+  }, [])
+
+  const setRadioGroupNode = useCallback(
+    (node: HTMLDivElement | null): void => {
+      // Why: the queued arrow-key focus is only valid while this radiogroup is mounted.
+      if (!node) {
+        cancelRadioFocusFrame()
+      }
+      radioGroupRef.current = node
+    },
+    [cancelRadioFocusFrame]
+  )
 
   // Arrow keys cycle selection within the radiogroup (WAI-ARIA radio pattern).
   const cycleKind = useCallback(() => {
     const next = createKind === 'git' ? 'folder' : 'git'
     onKindChange(next)
-    requestAnimationFrame(() => {
+    cancelRadioFocusFrame()
+    radioFocusFrameRef.current = requestAnimationFrame(() => {
+      radioFocusFrameRef.current = null
       const nextEl = radioGroupRef.current?.querySelector<HTMLButtonElement>(
         `[data-kind="${next}"]`
       )
       nextEl?.focus()
     })
-  }, [createKind, onKindChange])
+  }, [cancelRadioFocusFrame, createKind, onKindChange])
 
-  const trimmedName = createName.trim()
-  const canSubmit = trimmedName.length > 0 && createParent.trim().length > 0 && !isCreating
+  const canSubmit = createName.trim().length > 0 && createParent.trim().length > 0 && !isCreating
+
+  if (browsingParent && runtimeEnvironmentId) {
+    return (
+      <CreateProjectParentBrowser
+        runtimeEnvironmentId={runtimeEnvironmentId}
+        createParent={createParent}
+        onParentChange={onParentChange}
+        onClose={() => setBrowsingParent(false)}
+      />
+    )
+  }
 
   return (
     <>
@@ -311,7 +348,7 @@ export function CreateStep({
       <div className="space-y-3.5 pt-1 min-w-0">
         {/* Kind toggle. Real radiogroup so screen readers announce it as a choice. */}
         <div
-          ref={radioGroupRef}
+          ref={setRadioGroupNode}
           role="radiogroup"
           aria-label="Project kind"
           className="grid grid-cols-2 gap-2"
@@ -359,54 +396,16 @@ export function CreateStep({
           />
         </div>
 
-        {/* Location. The local flow uses a folder picker; runtime servers need
-          manual server-path entry because the client cannot browse that filesystem yet. */}
-        <div className="space-y-1">
-          <span className="text-[11px] font-medium text-muted-foreground block">Location</span>
-
-          {manualParentEntry ? (
-            <Input
-              value={createParent}
-              onChange={(e) => onParentChange(e.target.value)}
-              placeholder="/home/user/projects"
-              className="h-11 text-sm font-mono"
-              disabled={isCreating}
-              spellCheck={false}
-            />
-          ) : createParent ? (
-            <div className="group flex items-center gap-2.5 rounded-md border border-border bg-background/40 h-11 min-w-0 px-3 text-sm">
-              <span className="shrink-0 inline-flex items-center justify-center size-7 rounded-md border border-border/70 bg-background/50 text-muted-foreground">
-                <Home className="size-3.5" />
-              </span>
-              <span className="flex-1 min-w-0 truncate font-mono text-[12px]" title={createParent}>
-                {createParent}
-              </span>
-              <button
-                type="button"
-                onClick={onPickParent}
-                disabled={isCreating}
-                className="shrink-0 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors cursor-pointer disabled:cursor-not-allowed"
-                aria-label="Change parent folder"
-              >
-                <Pencil className="size-3" />
-                Change
-              </button>
-            </div>
-          ) : (
-            <Button
-              type="button"
-              variant="outline"
-              onClick={onPickParent}
-              disabled={isCreating}
-              className="w-full h-11 justify-start text-sm text-muted-foreground font-normal gap-2.5"
-            >
-              <span className="shrink-0 inline-flex items-center justify-center size-7 rounded-md border border-border/70 bg-background/40">
-                <Folder className="size-3.5" />
-              </span>
-              Choose parent folder…
-            </Button>
-          )}
-        </div>
+        {/* The local picker returns client paths; runtime servers browse host paths via RPC. */}
+        <CreateProjectLocationField
+          createParent={createParent}
+          isCreating={isCreating}
+          manualParentEntry={manualParentEntry}
+          runtimeEnvironmentId={runtimeEnvironmentId}
+          onParentChange={onParentChange}
+          onPickParent={onPickParent}
+          onBrowseServer={() => setBrowsingParent(true)}
+        />
 
         {createError && (
           <p className="text-[11px] text-destructive" role="alert">

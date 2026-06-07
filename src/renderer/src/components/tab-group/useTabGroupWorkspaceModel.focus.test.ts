@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { TOGGLE_TERMINAL_PANE_EXPAND_EVENT } from '@/constants/terminal'
 
 const mocks = vi.hoisted(() => ({
   activateTab: vi.fn(),
@@ -12,12 +13,15 @@ const mocks = vi.hoisted(() => ({
   createEmptySplitGroup: vi.fn(),
   createTab: vi.fn(),
   destroyWorkspaceWebviews: vi.fn(),
+  dispatchEvent: vi.fn(),
   dropUnifiedTab: vi.fn(),
   focusGroup: vi.fn(),
   focusTerminalTabSurface: vi.fn(),
   isWebRuntimeSessionActive: vi.fn(() => false),
+  makePreviewFilePermanent: vi.fn(),
   openFile: vi.fn(),
   pinFile: vi.fn(),
+  recordFeatureInteraction: vi.fn(),
   setActiveBrowserTab: vi.fn(),
   setActiveFile: vi.fn(),
   setActiveTab: vi.fn(),
@@ -75,7 +79,7 @@ vi.mock('../../store/slices/browser-webview-cleanup', () => ({
 }))
 
 vi.mock('../../lib/create-untitled-markdown', () => ({
-  createUntitledMarkdownFile: vi.fn()
+  createUntitledMarkdownFileWithTemplateSelection: vi.fn()
 }))
 
 vi.mock('../../lib/ipc-error', () => ({
@@ -139,8 +143,10 @@ function resetStore(): void {
     createTab: mocks.createTab,
     dropUnifiedTab: mocks.dropUnifiedTab,
     focusGroup: mocks.focusGroup,
+    makePreviewFilePermanent: mocks.makePreviewFilePermanent,
     openFile: mocks.openFile,
     pinFile: mocks.pinFile,
+    recordFeatureInteraction: mocks.recordFeatureInteraction,
     setActiveBrowserTab: mocks.setActiveBrowserTab,
     setActiveFile: mocks.setActiveFile,
     setActiveTab: mocks.setActiveTab,
@@ -155,6 +161,17 @@ describe('useTabGroupWorkspaceModel terminal activation focus', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetStore()
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callback(0)
+      return 1
+    })
+    vi.stubGlobal('window', {
+      dispatchEvent: mocks.dispatchEvent
+    })
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
   it('returns keyboard focus to xterm after a terminal tab is activated', async () => {
@@ -168,5 +185,35 @@ describe('useTabGroupWorkspaceModel terminal activation focus', () => {
     expect(mocks.setActiveTab).toHaveBeenCalledWith('terminal-1')
     expect(mocks.setActiveTabType).toHaveBeenCalledWith('terminal')
     expect(mocks.focusTerminalTabSurface).toHaveBeenCalledWith('terminal-1')
+  })
+
+  it('toggles pane expansion from the split-group tab bar collapse button', async () => {
+    const { useTabGroupWorkspaceModel } = await import('./useTabGroupWorkspaceModel')
+    const model = useTabGroupWorkspaceModel({ groupId: 'group-1', worktreeId: 'wt-1' })
+
+    model.commands.toggleTerminalPaneExpand('terminal-1')
+
+    expect(mocks.focusGroup).toHaveBeenCalledWith('wt-1', 'group-1')
+    expect(mocks.activateTab).toHaveBeenCalledWith('unified-terminal-1')
+    expect(mocks.setActiveTab).toHaveBeenCalledWith('terminal-1')
+    expect(mocks.setActiveTabType).toHaveBeenCalledWith('terminal')
+    const event = mocks.dispatchEvent.mock.calls[0]?.[0] as CustomEvent<{ tabId: string }>
+    expect(event.type).toBe(TOGGLE_TERMINAL_PANE_EXPAND_EVENT)
+    expect(event.detail).toEqual({ tabId: 'terminal-1' })
+  })
+
+  it('records terminal split completion when splitting a single terminal tab group', async () => {
+    mocks.createEmptySplitGroup.mockReturnValue('group-2')
+    mocks.createTab.mockReturnValue({ id: 'terminal-2' })
+    const { useTabGroupWorkspaceModel } = await import('./useTabGroupWorkspaceModel')
+    const model = useTabGroupWorkspaceModel({ groupId: 'group-1', worktreeId: 'wt-1' })
+
+    model.commands.createSplitGroup('right')
+
+    expect(mocks.createEmptySplitGroup).toHaveBeenCalledWith('wt-1', 'group-1', 'right')
+    expect(mocks.createTab).toHaveBeenCalledWith('wt-1', 'group-2')
+    expect(mocks.recordFeatureInteraction).toHaveBeenCalledWith('terminal-pane-split')
+    expect(mocks.setActiveTab).toHaveBeenCalledWith('terminal-2')
+    expect(mocks.setActiveTabType).toHaveBeenCalledWith('terminal')
   })
 })

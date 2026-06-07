@@ -7,6 +7,17 @@
  * Duplicating this logic would risk drift between the two detection paths.
  */
 
+import {
+  AGY_AGENT_NAME_RE,
+  DROID_AGENT_NAME_RE,
+  HERMES_AGENT_NAME_RE,
+  titleHasAgentName,
+  titleHasAnyLegacyAgentName
+} from './agent-name-token-match'
+
+// Re-export so existing `agent-detection` importers keep working.
+export { AGENT_NAMES, titleHasAgentName } from './agent-name-token-match'
+
 export type AgentStatus = 'working' | 'permission' | 'idle'
 
 const CLAUDE_IDLE = '\u2733' // ✳ (eight-spoked asterisk — Claude Code idle prefix)
@@ -15,32 +26,6 @@ const GEMINI_WORKING = '\u2726' // ✦
 const GEMINI_SILENT_WORKING = '\u23F2' // ⏲
 const GEMINI_IDLE = '\u25C7' // ◇
 const GEMINI_PERMISSION = '\u270B' // ✋
-
-// Why: this list is for OSC-title detection only. It is intentionally narrower
-// than the full set of launchable agents because short names like "amp" are
-// unsafe under the substring-based detector and would classify ordinary shell
-// titles like "timestamp ready" as agent activity. Product telemetry uses the
-// explicit launch/session facts Orca owns, not this inference path.
-export const AGENT_NAMES = [
-  'claude',
-  'codex',
-  'copilot',
-  'cursor',
-  'gemini',
-  'opencode',
-  'openclaw',
-  'aider',
-  'grok'
-]
-
-// Why: `android` contains `droid`; unlike the legacy agent names above, Droid
-// must be token-matched so Android terminal titles do not become agent status.
-const DROID_AGENT_NAME_RE = /(?<![\w./\\-])droid(?![\w./\\-])/i
-
-// Why: Hermes is safe to token-match but unsafe to add to the legacy
-// substring list because cwd/path titles like `~/hermes/working` would
-// otherwise count as agent activity.
-const HERMES_AGENT_NAME_RE = /(?<![\w./\\-])hermes(?![\w./\\-])/i
 
 // Why: idle keywords used inside `detectAgentStatusFromTitle` to map titles
 // like "Codex done", "OpenCode ready", "Aider idle" to AgentStatus 'idle'.
@@ -111,6 +96,9 @@ const OSC_TITLE_RE = /\x1b\]([012]);([^\x07\x1b]*?)(?:\x07|\x1b\\)/g
  * normalizeTerminalChunk pass.
  */
 export function extractLastOscTitle(data: string): string | null {
+  if (!data.includes('\x1b]')) {
+    return null
+  }
   let last: string | null = null
   for (const m of data.matchAll(OSC_TITLE_RE)) {
     last = m[2]
@@ -129,6 +117,9 @@ export function extractLastOscTitle(data: string): string | null {
  * spinner-miss follow-up.
  */
 export function extractAllOscTitles(data: string): string[] {
+  if (!data.includes('\x1b]')) {
+    return []
+  }
   const titles: string[] = []
   for (const m of data.matchAll(OSC_TITLE_RE)) {
     titles.push(m[2])
@@ -167,13 +158,13 @@ function containsBrailleSpinner(title: string): boolean {
 }
 
 function containsLegacyAgentName(title: string): boolean {
-  const lower = title.toLowerCase()
-  return AGENT_NAMES.some((name) => lower.includes(name))
+  return titleHasAnyLegacyAgentName(title)
 }
 
 function containsAgentName(title: string): boolean {
   return (
     containsLegacyAgentName(title) ||
+    AGY_AGENT_NAME_RE.test(title) ||
     DROID_AGENT_NAME_RE.test(title) ||
     HERMES_AGENT_NAME_RE.test(title)
   )
@@ -311,6 +302,7 @@ export function isClaudeAgent(title: string): boolean {
   if (!title) {
     return false
   }
+  const lower = title.toLowerCase()
 
   // Why: Claude Code titles are prefixed with status indicators (✳, ". ", "* ",
   // braille spinners) followed by the task description. The task text can
@@ -325,19 +317,18 @@ export function isClaudeAgent(title: string): boolean {
     return true
   }
   if (containsBrailleSpinner(title)) {
-    // Why: Orca synthesizes `⠋ Cursor Agent` working titles for cursor-agent
-    // panes (see hook listener in main/index.ts). Those titles carry a braille
-    // spinner but are decidedly not Claude — the prompt-cache timer and other
-    // Claude-scoped paths must not fire for them.
-    if (title.toLowerCase().includes('cursor')) {
-      return false
-    }
-    return true
+    // Why: named non-Claude agents can carry braille spinners too; Claude-only
+    // prompt-cache paths must not fire for those explicit agent titles.
+    return !lower.includes('cursor') && !lower.includes('openclaude')
   }
   // Why: permission/action-required Claude titles can omit the usual prefixes.
-  // Requiring "claude" at the start avoids false positives from other agents
-  // whose task text merely mentions Claude.
-  if (title.toLowerCase().startsWith('claude')) {
+  // Token-match so cwd/worktree titles like "claude-scratch" do not become
+  // Claude tabs, while task text that merely mentions Claude still stays out.
+  const trimmedTitle = title.trimStart()
+  if (
+    trimmedTitle.toLowerCase().startsWith('claude') &&
+    titleHasAgentName(trimmedTitle, 'claude')
+  ) {
     return true
   }
 
@@ -345,8 +336,6 @@ export function isClaudeAgent(title: string): boolean {
 }
 
 export function getAgentLabel(title: string): string | null {
-  const lower = title.toLowerCase()
-
   if (isGeminiTerminalTitle(title)) {
     return 'Gemini CLI'
   }
@@ -357,20 +346,28 @@ export function getAgentLabel(title: string): string | null {
   }
   // Why: Codex/OpenCode/Aider can also use braille spinner prefixes while
   // working. Prefer explicit name matches before Claude's generic spinner
-  // heuristic so mixed-agent hovercards stay truthful.
-  if (lower.includes('codex')) {
+  // heuristic so mixed-agent hovercards stay truthful. Token-match (not
+  // substring) so cwd/worktree titles like "opencode-blinker" don't mint a
+  // false agent identity.
+  if (titleHasAgentName(title, 'codex')) {
     return 'Codex'
   }
-  if (lower.includes('copilot')) {
+  if (titleHasAgentName(title, 'openclaude')) {
+    return 'OpenClaude'
+  }
+  if (titleHasAgentName(title, 'copilot')) {
     return 'GitHub Copilot'
   }
-  if (lower.includes('grok')) {
+  if (titleHasAgentName(title, 'grok')) {
     return 'Grok'
   }
-  if (lower.includes('opencode')) {
+  if (titleHasAgentName(title, 'antigravity') || AGY_AGENT_NAME_RE.test(title)) {
+    return 'Antigravity'
+  }
+  if (titleHasAgentName(title, 'opencode')) {
     return 'OpenCode'
   }
-  if (lower.includes('aider')) {
+  if (titleHasAgentName(title, 'aider')) {
     return 'Aider'
   }
   // Why: the cursor-agent native title is the literal string "Cursor Agent"
@@ -378,8 +375,9 @@ export function getAgentLabel(title: string): string | null {
   // label from hook events so the braille-spinner + agent-name path lights
   // up working/permission/idle transitions in the renderer. Match before
   // `isClaudeAgent` because Claude's generic braille heuristic would
-  // otherwise claim every "⠋ Cursor Agent" frame as Claude.
-  if (lower.includes('cursor')) {
+  // otherwise claim every "⠋ Cursor Agent" frame as Claude. Token-match so a
+  // cwd like "~/cursor-rules" can't masquerade as a Cursor agent.
+  if (titleHasAgentName(title, 'cursor')) {
     return 'Cursor'
   }
   // Why: synthesized "⠋ Droid" working title needs to be matched before Claude's braille heuristic.
@@ -446,8 +444,9 @@ export function detectAgentStatusFromTitle(title: string): AgentStatus | null {
 
   const hasDroidAgentName = DROID_AGENT_NAME_RE.test(title)
   const hasHermesAgentName = HERMES_AGENT_NAME_RE.test(title)
+  const hasAgyAgentName = AGY_AGENT_NAME_RE.test(title)
   const hasLegacyAgentName = containsLegacyAgentName(title)
-  if (hasLegacyAgentName || hasDroidAgentName || hasHermesAgentName) {
+  if (hasLegacyAgentName || hasDroidAgentName || hasHermesAgentName || hasAgyAgentName) {
     if (containsAny(title, ['action required', 'permission', 'waiting'])) {
       return 'permission'
     }
@@ -494,18 +493,16 @@ export function detectAgentStatusFromTitle(title: string): AgentStatus | null {
 // renderer (agent-ready-wait, new-workspace). A bare shell is the only process
 // type that garbles injected preambles, so this is the negative signal for
 // "is an agent running".
-const SHELL_NAMES = new Set([
-  '',
-  'bash',
-  'zsh',
-  'sh',
-  'fish',
-  'cmd.exe',
-  'powershell.exe',
-  'pwsh.exe',
-  'nu'
-])
+const SHELL_NAMES = new Set(
+  '|bash|zsh|sh|fish|cmd|cmd.exe|powershell|powershell.exe|pwsh|pwsh.exe|nu'.split('|')
+)
 
 export function isShellProcess(processName: string): boolean {
-  return SHELL_NAMES.has(processName.trim().toLowerCase())
+  const normalized = processName
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .toLowerCase()
+  return (
+    SHELL_NAMES.has(normalized) || SHELL_NAMES.has(normalized.split(/[\\/]/).pop() ?? normalized)
+  )
 }

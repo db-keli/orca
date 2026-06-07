@@ -14,6 +14,7 @@ import {
   readRuntimeFileContent,
   readRuntimeFilePreview,
   renameRuntimePath,
+  runtimePathExists,
   searchRuntimeFiles,
   statRuntimePath,
   subscribeRuntimeFileChanges,
@@ -33,6 +34,7 @@ const fsCreateFile = vi.fn()
 const fsRename = vi.fn()
 const fsDeletePath = vi.fn()
 const fsStat = vi.fn()
+const fsPathExists = vi.fn()
 const fsImportExternalPaths = vi.fn()
 const fsStageExternalPathsForRuntimeUpload = vi.fn()
 const runtimeEnvironmentCall = vi.fn()
@@ -41,6 +43,7 @@ const runtimeEnvironmentSubscribe = vi.fn()
 const runtimeCall = vi.fn()
 
 beforeEach(() => {
+  delete (globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__
   clearRuntimeCompatibilityCacheForTests()
   fsReadFile.mockReset()
   fsOnChanged.mockReset()
@@ -50,6 +53,7 @@ beforeEach(() => {
   fsRename.mockReset()
   fsDeletePath.mockReset()
   fsStat.mockReset()
+  fsPathExists.mockReset()
   fsImportExternalPaths.mockReset()
   fsStageExternalPathsForRuntimeUpload.mockReset()
   runtimeEnvironmentCall.mockReset()
@@ -81,6 +85,7 @@ beforeEach(() => {
         rename: fsRename,
         deletePath: fsDeletePath,
         stat: fsStat,
+        pathExists: fsPathExists,
         importExternalPaths: fsImportExternalPaths,
         stageExternalPathsForRuntimeUpload: fsStageExternalPathsForRuntimeUpload
       },
@@ -117,7 +122,7 @@ describe('runtime file client', () => {
       id: 'rpc-1',
       ok: true,
       result: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: 'src/index.ts',
         content: 'export {}\n',
         truncated: false,
@@ -138,7 +143,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.read',
-      params: { worktree: 'wt-1', relativePath: 'src/index.ts' },
+      params: { worktree: 'id:wt-1', relativePath: 'src/index.ts' },
       timeoutMs: 15_000
     })
     expect(fsReadFile).not.toHaveBeenCalled()
@@ -189,7 +194,7 @@ describe('runtime file client', () => {
       id: 'rpc-1',
       ok: true,
       result: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: 'large.log',
         content: 'partial',
         truncated: true,
@@ -237,7 +242,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.readDir',
-      params: { worktree: 'wt-1', relativePath: 'src' },
+      params: { worktree: 'id:wt-1', relativePath: 'src' },
       timeoutMs: 15_000
     })
   })
@@ -262,7 +267,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.readDir',
-      params: { worktree: 'wt-1', relativePath: 'Src' },
+      params: { worktree: 'id:wt-1', relativePath: 'Src' },
       timeoutMs: 15_000
     })
   })
@@ -287,7 +292,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.readDir',
-      params: { worktree: 'wt-1', relativePath: 'src' },
+      params: { worktree: 'id:wt-1', relativePath: 'src' },
       timeoutMs: 15_000
     })
   })
@@ -319,7 +324,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.readPreview',
-      params: { worktree: 'wt-1', relativePath: 'images/logo.png' },
+      params: { worktree: 'id:wt-1', relativePath: 'images/logo.png' },
       timeoutMs: 15_000
     })
   })
@@ -360,7 +365,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.readDir',
-      params: { worktree: 'wt-1', relativePath: '' },
+      params: { worktree: 'id:wt-1', relativePath: '' },
       timeoutMs: 15_000
     })
   })
@@ -406,14 +411,14 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(1, {
       selector: 'env-1',
       method: 'files.createFile',
-      params: { worktree: 'wt-1', relativePath: 'src/new.ts' },
+      params: { worktree: 'id:wt-1', relativePath: 'src/new.ts' },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(2, {
       selector: 'env-1',
       method: 'files.rename',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         oldRelativePath: 'src/new.ts',
         newRelativePath: 'src/renamed.ts'
       },
@@ -423,7 +428,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.copy',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         sourceRelativePath: 'src/renamed.ts',
         destinationRelativePath: 'src/renamed copy.ts'
       },
@@ -432,7 +437,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(4, {
       selector: 'env-1',
       method: 'files.delete',
-      params: { worktree: 'wt-1', relativePath: 'src/renamed.ts', recursive: false },
+      params: { worktree: 'id:wt-1', relativePath: 'src/renamed.ts', recursive: false },
       timeoutMs: 15_000
     })
   })
@@ -608,25 +613,25 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(1, {
       selector: 'env-1',
       method: 'files.stat',
-      params: { worktree: 'wt-1', relativePath: 'uploads' },
+      params: { worktree: 'id:wt-1', relativePath: 'uploads' },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(2, {
       selector: 'env-1',
       method: 'files.createDir',
-      params: { worktree: 'wt-1', relativePath: 'uploads' },
+      params: { worktree: 'id:wt-1', relativePath: 'uploads' },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(3, {
       selector: 'env-1',
       method: 'files.stat',
-      params: { worktree: 'wt-1', relativePath: 'uploads/assets' },
+      params: { worktree: 'id:wt-1', relativePath: 'uploads/assets' },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(4, {
       selector: 'env-1',
       method: 'files.createDirNoClobber',
-      params: { worktree: 'wt-1', relativePath: 'uploads/assets' },
+      params: { worktree: 'id:wt-1', relativePath: 'uploads/assets' },
       timeoutMs: 15_000
     })
     const smallWriteCall = runtimeEnvironmentCall.mock.calls[4]?.[0] as {
@@ -639,7 +644,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.writeBase64',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: smallWriteCall.params.relativePath,
         contentBase64: 'cG5n'
       },
@@ -649,7 +654,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.commitUpload',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         tempRelativePath: smallWriteCall.params.relativePath,
         finalRelativePath: 'uploads/assets/logo.png'
       },
@@ -659,7 +664,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.delete',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: smallWriteCall.params.relativePath,
         recursive: false
       },
@@ -758,7 +763,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.writeBase64Chunk',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: chunkWriteCall.params.relativePath,
         contentBase64: firstChunk,
         append: false
@@ -769,7 +774,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.writeBase64Chunk',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: chunkWriteCall.params.relativePath,
         contentBase64: secondChunk,
         append: true
@@ -780,7 +785,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.commitUpload',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         tempRelativePath: chunkWriteCall.params.relativePath,
         finalRelativePath: 'uploads/large.bin'
       },
@@ -790,7 +795,7 @@ describe('runtime file client', () => {
       selector: 'env-1',
       method: 'files.delete',
       params: {
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         relativePath: chunkWriteCall.params.relativePath,
         recursive: false
       },
@@ -882,7 +887,89 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenLastCalledWith({
       selector: 'env-1',
       method: 'files.delete',
-      params: { worktree: 'wt-1', relativePath: tempRelativePath, recursive: false },
+      params: { worktree: 'id:wt-1', relativePath: tempRelativePath, recursive: false },
+      timeoutMs: 15_000
+    })
+  })
+
+  it('removes a created runtime directory import root when a nested file upload fails', async () => {
+    fsStageExternalPathsForRuntimeUpload.mockResolvedValue({
+      sources: [
+        {
+          sourcePath: '/Users/me/assets',
+          status: 'staged',
+          name: 'assets',
+          kind: 'directory',
+          entries: [
+            { relativePath: '', kind: 'directory' },
+            { relativePath: 'logo.png', kind: 'file', contentBase64: 'cG5n' }
+          ]
+        }
+      ]
+    })
+    runtimeEnvironmentCall
+      .mockResolvedValueOnce({
+        id: 'stat-destination',
+        ok: true,
+        result: { size: 0, isDirectory: true, mtime: 1 },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'stat-import-root-miss',
+        ok: false,
+        error: { code: 'not_found', message: 'not found' },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'create-import-root',
+        ok: true,
+        result: { ok: true },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'write-file',
+        ok: false,
+        error: { code: 'write_failed', message: 'disk full' },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'delete-temp',
+        ok: true,
+        result: { ok: true },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+      .mockResolvedValueOnce({
+        id: 'delete-import-root',
+        ok: true,
+        result: { ok: true },
+        _meta: { runtimeId: 'remote-runtime' }
+      })
+
+    await expect(
+      importExternalPathsToRuntime(
+        {
+          settings: { activeRuntimeEnvironmentId: 'env-1' },
+          worktreeId: 'wt-1',
+          worktreePath: '/remote/repo'
+        },
+        ['/Users/me/assets'],
+        '/remote/repo/uploads'
+      )
+    ).resolves.toMatchObject({
+      results: [{ status: 'failed', reason: 'disk full' }]
+    })
+
+    const writeCall = runtimeEnvironmentCall.mock.calls[3]?.[0] as
+      | { params: { relativePath: string } }
+      | undefined
+    if (!writeCall) {
+      throw new Error('missing failed file write call')
+    }
+    expect(writeCall.params.relativePath).toMatch(/^uploads\/assets\/\.logo\.png\.orca-upload-/)
+    expect(runtimeEnvironmentCall).toHaveBeenLastCalledWith({
+      selector: 'env-1',
+      method: 'files.delete',
+      params: { worktree: 'id:wt-1', relativePath: 'uploads/assets', recursive: true },
       timeoutMs: 15_000
     })
   })
@@ -949,7 +1036,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.search',
-      params: { worktree: 'wt-1', query: 'needle', caseSensitive: true, maxResults: 50 },
+      params: { worktree: 'id:wt-1', query: 'needle', caseSensitive: true, maxResults: 50 },
       timeoutMs: 15_000
     })
   })
@@ -979,7 +1066,7 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenCalledWith({
       selector: 'env-1',
       method: 'files.listAll',
-      params: { worktree: 'wt-1', excludePaths: ['/remote/repo-other'] },
+      params: { worktree: 'id:wt-1', excludePaths: ['/remote/repo-other'] },
       timeoutMs: 15_000
     })
   })
@@ -1003,15 +1090,37 @@ describe('runtime file client', () => {
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(1, {
       selector: 'env-1',
       method: 'files.listMarkdownDocuments',
-      params: { worktree: 'wt-1' },
+      params: { worktree: 'id:wt-1' },
       timeoutMs: 15_000
     })
     expect(runtimeEnvironmentCall).toHaveBeenNthCalledWith(2, {
       selector: 'env-1',
       method: 'files.stat',
-      params: { worktree: 'wt-1', relativePath: 'readme.md' },
+      params: { worktree: 'id:wt-1', relativePath: 'readme.md' },
       timeoutMs: 15_000
     })
+  })
+
+  it('uses quiet local path existence checks when no runtime environment is active', async () => {
+    fsPathExists.mockResolvedValueOnce(false)
+
+    await expect(
+      runtimePathExists(
+        {
+          settings: { activeRuntimeEnvironmentId: null },
+          worktreeId: 'wt-1',
+          worktreePath: '/repo',
+          connectionId: 'ssh-1'
+        },
+        '/repo/untitled.md'
+      )
+    ).resolves.toBe(false)
+
+    expect(fsPathExists).toHaveBeenCalledWith({
+      filePath: '/repo/untitled.md',
+      connectionId: 'ssh-1'
+    })
+    expect(fsStat).not.toHaveBeenCalled()
   })
 
   it('does not fall back to client-local stat for remote-owned paths outside the worktree', async () => {
@@ -1083,7 +1192,7 @@ describe('runtime file client', () => {
       {
         selector: 'env-1',
         method: 'files.watch',
-        params: { worktree: 'wt-1' },
+        params: { worktree: 'id:wt-1' },
         timeoutMs: 15_000
       },
       expect.any(Object)
@@ -1094,7 +1203,7 @@ describe('runtime file client', () => {
       ok: true,
       result: {
         type: 'changed',
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         events: [{ kind: 'update', absolutePath: '/remote/repo/readme.md' }]
       },
       _meta: { runtimeId: 'remote-runtime' }
@@ -1154,7 +1263,7 @@ describe('runtime file client', () => {
       ok: true,
       result: {
         type: 'changed',
-        worktree: 'wt-1',
+        worktree: 'id:wt-1',
         events: [{ kind: 'update', absolutePath: '/remote/repo/readme.md' }]
       },
       _meta: { runtimeId: 'remote-runtime' }
@@ -1181,6 +1290,78 @@ describe('runtime file client', () => {
         params: { subscriptionId: 'files-watch-1' },
         timeoutMs: 5_000
       })
+    )
+  })
+
+  it('delegates stopped pre-ready web shared file watch cleanup to the subscription handle', async () => {
+    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    const onPayload = vi.fn()
+    const unsubscribe = vi.fn()
+    let onResponse: ((response: unknown) => void) | undefined
+    runtimeEnvironmentSubscribe.mockImplementation((_args, callbacks) => {
+      onResponse = callbacks.onResponse
+      return Promise.resolve({ unsubscribe, sendBinary: vi.fn() })
+    })
+
+    const stop = await subscribeRuntimeFileChanges(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/remote/repo'
+      },
+      onPayload
+    )
+
+    stop()
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'files.unwatch' })
+    )
+
+    onResponse?.({
+      id: 'ready',
+      ok: true,
+      result: { type: 'ready', subscriptionId: 'files-watch-late' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'files.unwatch' })
+    )
+  })
+
+  it('delegates stopped ready web shared file watch cleanup to the subscription handle', async () => {
+    ;(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__ = true
+    const onPayload = vi.fn()
+    const unsubscribe = vi.fn()
+    let onResponse: ((response: unknown) => void) | undefined
+    runtimeEnvironmentSubscribe.mockImplementation((_args, callbacks) => {
+      onResponse = callbacks.onResponse
+      return Promise.resolve({ unsubscribe, sendBinary: vi.fn() })
+    })
+
+    const stop = await subscribeRuntimeFileChanges(
+      {
+        settings: { activeRuntimeEnvironmentId: 'env-1' },
+        worktreeId: 'wt-1',
+        worktreePath: '/remote/repo'
+      },
+      onPayload
+    )
+
+    onResponse?.({
+      id: 'ready',
+      ok: true,
+      result: { type: 'ready', subscriptionId: 'files-watch-ready' },
+      _meta: { runtimeId: 'remote-runtime' }
+    })
+
+    stop()
+
+    expect(unsubscribe).toHaveBeenCalledTimes(1)
+    expect(runtimeEnvironmentCall).not.toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'files.unwatch' })
     )
   })
 })

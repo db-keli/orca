@@ -2,7 +2,8 @@
 import type { RuntimeRpcResponse } from '../../../../shared/runtime-rpc-envelope'
 import type {
   RuntimeMobileSessionTabsResult,
-  RuntimeTerminalCreate
+  RuntimeTerminalCreate,
+  RuntimeTerminalSend
 } from '../../../../shared/runtime-types'
 import type { PtyConnectResult, PtyTransport, IpcPtyTransportOptions } from './pty-dispatcher'
 import { createPtyOutputProcessor } from './pty-transport'
@@ -17,6 +18,7 @@ import {
   getRemoteRuntimeTerminalMultiplexer,
   type RemoteRuntimeMultiplexedTerminal
 } from '../../runtime/remote-runtime-terminal-multiplexer'
+import { toRuntimeWorktreeSelector } from '../../runtime/runtime-worktree-selector'
 import {
   createRemoteRuntimePtyTextBatcher,
   createRemoteRuntimeViewportBatcher
@@ -29,12 +31,6 @@ const REMOTE_TERMINAL_INPUT_FLUSH_MS = 8
 const REMOTE_TERMINAL_VIEWPORT_FLUSH_MS = 33
 const HOST_SESSION_ATTACH_POLL_MS = 150
 const HOST_SESSION_ATTACH_TIMEOUT_MS = 15_000
-
-function normalizeRemoteTerminalInput(data: string): string {
-  // Why: PTYs expect the Enter key as carriage return. Some browser/mobile
-  // input paths can emit bare LF, which zsh renders with PROMPT_SP `%` marks.
-  return data.replace(/\r\n/g, '\r').replace(/\n/g, '\r')
-}
 
 function isRemoteTerminalGoneMessage(message: string): boolean {
   return (
@@ -92,17 +88,16 @@ export function createRemoteRuntimePtyTransport(
     hostTabId: string
   ): string | null {
     const terminalTabs = snapshot.tabs.filter((tab) => tab.type === 'terminal')
+    if (leafId) {
+      const requestedLeaf = terminalTabs.find(
+        (tab) => tab.status === 'ready' && tab.parentTabId === hostTabId && tab.leafId === leafId
+      )
+      return requestedLeaf?.terminal ?? null
+    }
     const preferred =
       terminalTabs.find(
-        (tab) =>
-          tab.status === 'ready' &&
-          tab.parentTabId === hostTabId &&
-          (!leafId || tab.leafId === leafId)
-      ) ??
-      terminalTabs.find(
         (tab) => tab.status === 'ready' && tab.parentTabId === hostTabId && tab.isActive
-      ) ??
-      terminalTabs.find((tab) => tab.status === 'ready' && tab.parentTabId === hostTabId)
+      ) ?? terminalTabs.find((tab) => tab.status === 'ready' && tab.parentTabId === hostTabId)
     return preferred?.terminal ?? null
   }
 
@@ -111,7 +106,10 @@ export function createRemoteRuntimePtyTransport(
     hostTabId: string
   ): boolean {
     return snapshot.tabs.some(
-      (tab) => tab.type === 'terminal' && (tab.parentTabId === hostTabId || tab.id === hostTabId)
+      (tab) =>
+        tab.type === 'terminal' &&
+        (tab.parentTabId === hostTabId || tab.id === hostTabId) &&
+        (!leafId || tab.leafId === leafId)
     )
   }
 
@@ -119,10 +117,11 @@ export function createRemoteRuntimePtyTransport(
     if (!worktreeId) {
       return null
     }
-    const worktree = `id:${worktreeId}`
+    const worktree = toRuntimeWorktreeSelector(worktreeId)
     const activated = await callRuntime<RuntimeMobileSessionTabsResult>('session.tabs.activate', {
       worktree,
-      tabId: hostTabId
+      tabId: hostTabId,
+      ...(leafId ? { leafId } : {})
     })
     const immediate = findReadyHostSessionHandle(activated, hostTabId)
     if (immediate) {
@@ -212,6 +211,28 @@ export function createRemoteRuntimePtyTransport(
     }
   }
 
+  async function sendInputAcceptedToRuntime(data: string): Promise<boolean> {
+    const targetHandle = handle
+    if (!connected || !targetHandle) {
+      return false
+    }
+    if (!data) {
+      return true
+    }
+    const text = `${inputBatcher.takePending()}${data}`
+    try {
+      const result = await callRuntime<{ send: RuntimeTerminalSend }>('terminal.send', {
+        terminal: targetHandle,
+        text,
+        client: { id: clientId, type: 'desktop' }
+      })
+      return result.send.accepted === true
+    } catch (error) {
+      storedCallbacks.onError?.(runtimeTerminalErrorMessage(error))
+      return false
+    }
+  }
+
   const inputBatcher = createRemoteRuntimePtyTextBatcher(REMOTE_TERMINAL_INPUT_FLUSH_MS, (text) => {
     const targetHandle = handle
     if (!connected || !targetHandle) {
@@ -289,7 +310,7 @@ export function createRemoteRuntimePtyTransport(
       client: { id: clientId, type: 'desktop' },
       viewport: desiredViewport ?? undefined,
       callbacks: {
-        onData: (data) => outputProcessor.processData(data, storedCallbacks),
+        onData: (data, meta) => outputProcessor.processData(data, storedCallbacks, undefined, meta),
         onSnapshot: (data) => {
           if (data) {
             outputProcessor.processData(data, storedCallbacks, {
@@ -356,7 +377,7 @@ export function createRemoteRuntimePtyTransport(
         }
 
         const created = await callRuntime<{ terminal: RuntimeTerminalCreate }>('terminal.create', {
-          worktree: worktreeId,
+          worktree: toRuntimeWorktreeSelector(worktreeId),
           command,
           env,
           tabId,
@@ -455,15 +476,16 @@ export function createRemoteRuntimePtyTransport(
       if (!connected || !handle) {
         return false
       }
-      const normalized = normalizeRemoteTerminalInput(data)
-      if (!normalized) {
+      if (!data) {
         return true
       }
-      // Why: remote terminal input currently crosses the runtime RPC boundary;
-      // coalescing same-frame key bursts avoids a per-keystroke remote round-trip.
-      inputBatcher.push(normalized)
+      // Why: callers use \r or terminal.send's enter flag for semantic Enter;
+      // literal LF bytes from paste/programmatic input must survive the stream.
+      inputBatcher.push(data)
       return true
     },
+
+    sendInputAccepted: sendInputAcceptedToRuntime,
 
     resize(cols: number, rows: number): boolean {
       if (!connected || !handle) {
@@ -482,6 +504,13 @@ export function createRemoteRuntimePtyTransport(
 
     getPtyId() {
       return remotePtyId
+    },
+
+    async serializeBuffer(opts) {
+      if (!connected || !multiplexedStream) {
+        return null
+      }
+      return multiplexedStream.serializeBuffer(opts)
     },
 
     destroy() {

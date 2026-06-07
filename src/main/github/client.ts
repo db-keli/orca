@@ -6,27 +6,39 @@ import type {
   IssueSourcePreference,
   ListWorkItemsResult,
   PRInfo,
+  PRConflictSummary,
+  PRRefreshOutcome,
   PRMergeableState,
+  PRReviewDecision,
   PRCheckDetail,
+  PRCheckRunDetails,
   GitHubCommentResult,
   GitHubPRReviewCommentInput,
   PRComment,
   GitHubViewer,
   GitHubWorkItem,
   GitHubPullRequestStateUpdate,
-  GitHubRerunPRChecksResult
+  GitHubRerunPRChecksResult,
+  GitHubPRMergeMethodSettings
 } from '../../shared/types'
 import type { CreateHostedReviewInput, CreateHostedReviewResult } from '../../shared/hosted-review'
 import {
   normalizeHostedReviewBaseRef,
   normalizeHostedReviewHeadRef
 } from '../../shared/hosted-review-refs'
+import { normalizeGitHubPRMergeMethodSettings } from '../../shared/github-pr-merge-methods'
 import { parseTaskQuery, type ParsedTaskQuery } from '../../shared/task-query'
-import { sortWorkItemsByUpdatedAt } from '../../shared/work-items'
-import { mkdtemp, rm, writeFile } from 'fs/promises'
+import {
+  GITHUB_WORK_ITEMS_SSH_REMOTE_REQUIRED_MESSAGE,
+  sortWorkItemsByUpdatedAt
+} from '../../shared/work-items'
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { getPRConflictSummary } from './conflict-summary'
+import { getSshFilesystemProvider } from '../providers/ssh-filesystem-dispatch'
+import { joinWorktreeRelativePath } from '../runtime/runtime-relative-paths'
+import { splitRemoteBranchName } from '../../shared/git-effective-upstream'
 import {
   execFileAsync,
   ghExecFileAsync,
@@ -46,6 +58,7 @@ import {
   getRemoteUrlForRepo,
   type OwnerRepo
 } from './gh-utils'
+import { getSshGitProvider } from '../providers/ssh-git-dispatch'
 export { _resetOwnerRepoCache } from './gh-utils'
 export {
   getIssue,
@@ -65,9 +78,141 @@ import {
   deriveCheckStatus
 } from './mappers'
 import { mapGraphQLReactionGroups, type GitHubGraphQLReactionGroup } from './comment-reactions'
-import { noteRateLimitSpend, rateLimitGuard } from './rate-limit'
+import {
+  getRateLimit,
+  noteRateLimitSpend,
+  rateLimitGuard,
+  type RateLimitBucketKind
+} from './rate-limit'
+
+type GhExecOptions = ReturnType<typeof ghRepoExecOptions>
 
 const ORCA_REPO = 'stablyai/orca'
+const PR_CHECK_LOG_TAIL_LINES = 200
+const PR_CHECK_LOG_TAIL_BYTES = 16 * 1024
+const PR_CHECK_LOG_TAIL_JOB_LIMIT = 5
+// Why: each entry holds up to 16KB of log text; bound the cache so a long
+// session reviewing many failing checks can't grow it without limit.
+const PR_CHECK_LOG_TAIL_CACHE_MAX_ENTRIES = 128
+const prCheckLogTailCache = new Map<string, string | null>()
+
+function setPrCheckLogTailCache(cacheKey: string, logTail: string | null): void {
+  prCheckLogTailCache.set(cacheKey, logTail)
+  while (prCheckLogTailCache.size > PR_CHECK_LOG_TAIL_CACHE_MAX_ENTRIES) {
+    const oldestKey = prCheckLogTailCache.keys().next().value
+    if (oldestKey === undefined) {
+      break
+    }
+    prCheckLogTailCache.delete(oldestKey)
+  }
+}
+const MERGE_QUEUE_CACHE_TTL_MS = 10 * 60 * 1000
+const MERGE_QUEUE_UNKNOWN_CACHE_TTL_MS = 60 * 1000
+const MERGE_QUEUE_CACHE_MAX_ENTRIES = 256
+type GitHubRepositoryMergeMetadata = {
+  mergeQueueRequired: boolean | null
+  mergeMethodSettings?: GitHubPRMergeMethodSettings
+}
+const repositoryMergeMetadataCache = new Map<
+  string,
+  { value: GitHubRepositoryMergeMetadata; expiresAt: number }
+>()
+
+export function _resetMergeQueueCacheForTests(): void {
+  repositoryMergeMetadataCache.clear()
+}
+
+export function _getMergeQueueCacheSizeForTests(): number {
+  return repositoryMergeMetadataCache.size
+}
+
+function pruneRepositoryMergeMetadataCache(now = Date.now()): void {
+  for (const [cacheKey, cached] of repositoryMergeMetadataCache) {
+    if (cached.expiresAt <= now) {
+      repositoryMergeMetadataCache.delete(cacheKey)
+    }
+  }
+  while (repositoryMergeMetadataCache.size > MERGE_QUEUE_CACHE_MAX_ENTRIES) {
+    const oldestKey = repositoryMergeMetadataCache.keys().next().value
+    if (oldestKey === undefined) {
+      break
+    }
+    repositoryMergeMetadataCache.delete(oldestKey)
+  }
+}
+
+async function assertRateLimitBudget(bucket: RateLimitBucketKind): Promise<void> {
+  await getRateLimit()
+  const guard = rateLimitGuard(bucket)
+  if (guard.blocked) {
+    throw new Error(
+      `GitHub ${bucket} rate limit is low; retry after ${new Date(guard.resetAt * 1000).toLocaleTimeString()}`
+    )
+  }
+}
+
+function classifyPRRefreshError(
+  err: unknown
+): Extract<PRRefreshOutcome, { kind: 'upstream-error' }>['errorType'] {
+  const message = err instanceof Error ? err.message : String(err)
+  const lower = message.toLowerCase()
+  if (lower.includes('rate limit')) {
+    return 'rate_limited'
+  }
+  if (
+    lower.includes('timeout') ||
+    lower.includes('no such host') ||
+    lower.includes('network') ||
+    lower.includes('could not resolve host')
+  ) {
+    return 'network'
+  }
+  if (lower.includes('http 403') || lower.includes('resource not accessible')) {
+    return 'permission'
+  }
+  if (lower.includes('http 404') || lower.includes('could not resolve to a repository')) {
+    return 'repo_unavailable'
+  }
+  return /auth|login|credential/i.test(message) ? 'auth' : 'unknown'
+}
+
+function safePRRefreshErrorMessage(
+  errorType: Extract<PRRefreshOutcome, { kind: 'upstream-error' }>['errorType']
+): string {
+  switch (errorType) {
+    case 'rate_limited':
+      return 'GitHub rate limit is low. Try again after the limit resets.'
+    case 'auth':
+      return 'GitHub authentication is unavailable. Check your gh login.'
+    case 'network':
+      return 'GitHub is unreachable right now. Check your network and try again.'
+    case 'permission':
+      return 'GitHub did not allow access to this pull request.'
+    case 'repo_unavailable':
+      return 'The GitHub repository is unavailable or cannot be resolved.'
+    case 'gh_unavailable':
+      return 'GitHub CLI is unavailable.'
+    case 'unknown':
+      return 'GitHub pull request refresh failed.'
+  }
+}
+
+function prRefreshUpstreamError(
+  err: unknown
+): Extract<PRRefreshOutcome, { kind: 'upstream-error' }> {
+  const errorType = classifyPRRefreshError(err)
+  return {
+    kind: 'upstream-error',
+    errorType,
+    message: safePRRefreshErrorMessage(errorType),
+    fetchedAt: Date.now()
+  }
+}
+
+function isNoPullRequestError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /no pull requests? found|could not find.*pull request/i.test(message)
+}
 
 /**
  * Check if the authenticated user has starred the Orca repo.
@@ -248,14 +393,17 @@ export async function getAuthenticatedViewer(): Promise<GitHubViewer | null> {
 // single-repo and cross-repo items are uniform downstream.
 type MainWorkItem = Omit<GitHubWorkItem, 'repoId'>
 
+const WORK_ITEM_ISSUE_LIST_JSON_FIELDS = 'number,title,state,url,labels,updatedAt,author,assignees'
+
 const WORK_ITEM_PR_LIST_JSON_FIELDS =
-  'number,title,state,url,labels,updatedAt,author,isDraft,headRefName,baseRefName,headRepositoryOwner'
+  'number,title,state,url,labels,updatedAt,author,isDraft,headRefName,baseRefName,headRefOid,headRepositoryOwner,reviewRequests'
 
 // Why: these fields are intentionally excluded from `gh pr list` because
-// statusCheckRollup/review/merge metadata fan out into expensive GraphQL work
-// across every row. Fetch them only for single-PR detail surfaces.
+// statusCheckRollup/review decision/PR-specific merge metadata fan out into
+// expensive GraphQL work across every row. Requested reviewers are kept in the
+// list payload because the Tasks table renders that column on first paint.
 const WORK_ITEM_PR_DETAIL_JSON_FIELDS =
-  'number,title,state,url,labels,updatedAt,author,isDraft,headRefName,baseRefName,headRepositoryOwner,additions,deletions,changedFiles,reviewDecision,reviewRequests,latestReviews,assignees,statusCheckRollup,mergeable,mergeStateStatus,maintainerCanModify'
+  'number,title,state,url,labels,updatedAt,author,isDraft,headRefName,baseRefName,headRefOid,headRepositoryOwner,additions,deletions,changedFiles,reviewDecision,reviewRequests,latestReviews,assignees,statusCheckRollup,mergeable,mergeStateStatus,autoMergeRequest,maintainerCanModify'
 
 function mapIssueWorkItem(item: Record<string, unknown>): MainWorkItem {
   return {
@@ -280,7 +428,8 @@ function mapIssueWorkItem(item: Record<string, unknown>): MainWorkItem {
         ? String((item.user as { login?: unknown }).login ?? '')
         : typeof item.author === 'object' && item.author !== null && 'login' in item.author
           ? String((item.author as { login?: unknown }).login ?? '')
-          : null
+          : null,
+    ...(item.assignees !== undefined ? { assignees: usersFromUnknown(item.assignees) } : {})
   }
 }
 
@@ -339,10 +488,18 @@ function userFromUnknown(
   if (!login) {
     return null
   }
+  const databaseId = numberFromUnknown(raw.databaseId)
   return {
     login,
     name: typeof raw.name === 'string' ? raw.name : null,
-    avatarUrl: typeof raw.avatarUrl === 'string' ? raw.avatarUrl : ''
+    avatarUrl:
+      typeof raw.avatarUrl === 'string'
+        ? raw.avatarUrl
+        : typeof raw.avatar_url === 'string'
+          ? raw.avatar_url
+          : databaseId !== undefined
+            ? `https://avatars.githubusercontent.com/u/${databaseId}?v=4`
+            : ''
   }
 }
 
@@ -409,6 +566,16 @@ function normalizePRMergeable(value: unknown): PRMergeableState | undefined {
   return undefined
 }
 
+function normalizeReviewDecision(value: unknown): PRReviewDecision | null {
+  return value === 'APPROVED' || value === 'CHANGES_REQUESTED' || value === 'REVIEW_REQUIRED'
+    ? value
+    : null
+}
+
+function isAutoMergeEnabled(value: unknown): boolean {
+  return typeof value === 'object' && value !== null
+}
+
 function checkRollupEntries(value: unknown): unknown[] {
   if (Array.isArray(value)) {
     return value
@@ -462,10 +629,10 @@ function deriveWorkItemCheckSummary(value: unknown): GitHubWorkItem['checksSumma
 
 function mapPullRequestWorkItem(
   item: Record<string, unknown>,
-  baseOwnerLogin: string | null = null
+  baseOwnerRepo: OwnerRepo | null = null
 ): MainWorkItem {
   // Why: fork PRs are disabled in the Start-from picker. We compare the PR head's
-  // owner to the selected repo's owner; when baseOwnerLogin is unknown we default
+  // owner to the selected repo's owner; when the base repo is unknown we default
   // to false so non-picker call sites see the same shape as before.
   const headOwnerLogin = extractHeadOwnerLogin(item)
   // Why: only emit isCrossRepository when we actually know the head owner. If
@@ -473,7 +640,9 @@ function mapPullRequestWorkItem(
   // that fixture, or gh not returning it), leave the field undefined instead
   // of falsely claiming "not a fork".
   const isCrossRepository =
-    headOwnerLogin !== null && baseOwnerLogin !== null ? headOwnerLogin !== baseOwnerLogin : null
+    headOwnerLogin !== null && baseOwnerRepo !== null
+      ? headOwnerLogin !== baseOwnerRepo.owner
+      : null
   const state = String(item.state ?? '').toLowerCase()
   const additions = numberFromUnknown(item.additions)
   const deletions = numberFromUnknown(item.deletions)
@@ -483,19 +652,27 @@ function mapPullRequestWorkItem(
       (item.files as { totalCount?: unknown } | undefined)?.totalCount
   )
   const mergeable = normalizePRMergeable(item.mergeable)
+  const headSha =
+    typeof item.headRefOid === 'string'
+      ? item.headRefOid
+      : typeof item.head === 'object' && item.head !== null
+        ? typeof (item.head as { sha?: unknown }).sha === 'string'
+          ? (item.head as { sha: string }).sha
+          : undefined
+        : undefined
   return {
     id: `pr:${String(item.number)}`,
     type: 'pr',
     number: Number(item.number),
     title: String(item.title ?? ''),
     state:
-      state === 'closed'
-        ? item.merged_at || item.mergedAt
-          ? 'merged'
-          : 'closed'
-        : item.isDraft || item.draft
-          ? 'draft'
-          : 'open',
+      state === 'merged' || item.merged_at || item.mergedAt
+        ? 'merged'
+        : state === 'closed'
+          ? 'closed'
+          : item.isDraft || item.draft
+            ? 'draft'
+            : 'open',
     url: String(item.html_url ?? item.url ?? ''),
     labels: Array.isArray(item.labels)
       ? item.labels
@@ -521,11 +698,13 @@ function mapPullRequestWorkItem(
       typeof item.base === 'object' && item.base !== null && 'ref' in item.base
         ? String((item.base as { ref?: unknown }).ref ?? '')
         : String(item.baseRefName ?? ''),
+    ...(headSha ? { headSha } : {}),
+    ...(baseOwnerRepo ? { prRepo: { owner: baseOwnerRepo.owner, repo: baseOwnerRepo.repo } } : {}),
     ...(additions !== undefined ? { additions } : {}),
     ...(deletions !== undefined ? { deletions } : {}),
     ...(changedFiles !== undefined ? { changedFiles } : {}),
     ...('reviewDecision' in item
-      ? { reviewDecision: typeof item.reviewDecision === 'string' ? item.reviewDecision : null }
+      ? { reviewDecision: normalizeReviewDecision(item.reviewDecision) }
       : {}),
     ...(item.reviewRequests !== undefined || item.requested_reviewers !== undefined
       ? { reviewRequests: usersFromUnknown(item.reviewRequests ?? item.requested_reviewers) }
@@ -538,6 +717,9 @@ function mapPullRequestWorkItem(
       ? { checksSummary: deriveWorkItemCheckSummary(item.statusCheckRollup) }
       : {}),
     ...(mergeable ? { mergeable } : {}),
+    ...('autoMergeRequest' in item
+      ? { autoMergeEnabled: isAutoMergeEnabled(item.autoMergeRequest) }
+      : {}),
     ...('mergeStateStatus' in item
       ? {
           mergeStateStatus: typeof item.mergeStateStatus === 'string' ? item.mergeStateStatus : null
@@ -548,6 +730,26 @@ function mapPullRequestWorkItem(
       : {}),
     ...(isCrossRepository !== null ? { isCrossRepository } : {})
   }
+}
+
+async function hydrateWorkItemMergeMethodSettings(
+  items: MainWorkItem[],
+  ownerRepo: OwnerRepo | null,
+  ghOptions: GhExecOptions
+): Promise<MainWorkItem[]> {
+  const hasPullRequest = items.some((item) => item.type === 'pr')
+  if (!ownerRepo || !hasPullRequest) {
+    return items
+  }
+  // Why: merge method settings are repository-level, so one cached metadata
+  // probe can keep Tasks rows accurate without per-PR GraphQL fan-out.
+  const mergeMetadata = await detectRepositoryMergeMetadata(ownerRepo, undefined, ghOptions)
+  if (!mergeMetadata.mergeMethodSettings) {
+    return items
+  }
+  return items.map((item) =>
+    item.type === 'pr' ? { ...item, mergeMethodSettings: mergeMetadata.mergeMethodSettings } : item
+  )
 }
 
 async function fetchIssueWorkItem(
@@ -584,11 +786,37 @@ async function fetchPullRequestWorkItem(
 ): Promise<MainWorkItem> {
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
   if (ownerRepo) {
-    const { stdout } = await ghExecFileAsync(
-      ['api', `repos/${ownerRepo.owner}/${ownerRepo.repo}/pulls/${number}`],
-      ghOptions
-    )
-    return mapPullRequestWorkItem(JSON.parse(stdout) as Record<string, unknown>, ownerRepo.owner)
+    try {
+      const { stdout } = await ghExecFileAsync(
+        [
+          'pr',
+          'view',
+          String(number),
+          '--repo',
+          `${ownerRepo.owner}/${ownerRepo.repo}`,
+          '--json',
+          WORK_ITEM_PR_DETAIL_JSON_FIELDS
+        ],
+        ghOptions
+      )
+      const item = JSON.parse(stdout) as Record<string, unknown>
+      const mapped = mapPullRequestWorkItem(item, ownerRepo)
+      const baseRefName = typeof item.baseRefName === 'string' ? item.baseRefName : undefined
+      const mergeMetadata = await detectRepositoryMergeMetadata(ownerRepo, baseRefName, ghOptions)
+      return {
+        ...mapped,
+        mergeQueueRequired: mergeMetadata.mergeQueueRequired,
+        ...(mergeMetadata.mergeMethodSettings
+          ? { mergeMethodSettings: mergeMetadata.mergeMethodSettings }
+          : {})
+      }
+    } catch {
+      const { stdout } = await ghExecFileAsync(
+        ['api', `repos/${ownerRepo.owner}/${ownerRepo.repo}/pulls/${number}`],
+        ghOptions
+      )
+      return mapPullRequestWorkItem(JSON.parse(stdout) as Record<string, unknown>, ownerRepo)
+    }
   }
 
   const { stdout } = await ghExecFileAsync(
@@ -606,10 +834,7 @@ function buildWorkItemListArgs(args: {
   before?: string
 }): string[] {
   const { kind, ownerRepo, limit, query, before } = args
-  const fields =
-    kind === 'issue'
-      ? 'number,title,state,url,labels,updatedAt,author'
-      : WORK_ITEM_PR_LIST_JSON_FIELDS
+  const fields = kind === 'issue' ? WORK_ITEM_ISSUE_LIST_JSON_FIELDS : WORK_ITEM_PR_LIST_JSON_FIELDS
   const command = kind === 'issue' ? ['issue', 'list'] : ['pr', 'list']
   const out = [...command, '--limit', String(limit), '--json', fields]
 
@@ -617,14 +842,13 @@ function buildWorkItemListArgs(args: {
     out.push('--repo', `${ownerRepo.owner}/${ownerRepo.repo}`)
   }
 
-  const state = query.state
-  if (state && !(kind === 'issue' && state === 'merged')) {
-    out.push('--state', state === 'all' ? 'all' : state)
+  if (query.state) {
+    out.push('--state', query.state)
   }
-
-  if (kind === 'pr' && query.state === 'merged') {
-    out.push('--state', 'merged')
-  }
+  // Why: GitHub considers merged PRs as "closed". When the user filters for
+  // closed-only, exclude merged PRs via the search predicate so the displayed
+  // and counted results match the user's intent.
+  const excludeMergedFromClosed = kind === 'pr' && query.state === 'closed'
 
   if (query.assignee) {
     out.push('--assignee', query.assignee)
@@ -645,6 +869,9 @@ function buildWorkItemListArgs(args: {
   }
 
   const searchParts: string[] = []
+  if (excludeMergedFromClosed) {
+    searchParts.push('-is:merged')
+  }
   // Why: cursor-based pagination. GitHub search supports updated:<DATE to
   // fetch items older than the cursor. We use the oldest item's updatedAt
   // from the previous page as the cursor.
@@ -676,15 +903,32 @@ type PartialWorkItemsResult = {
   issuesError?: ClassifiedError
 }
 
+function assertSshRepoHasResolvedGitHubSource(args: {
+  connectionId?: string | null
+  issueOwnerRepo: OwnerRepo | null
+  prOwnerRepo: OwnerRepo | null
+}): void {
+  if (!args.connectionId || args.issueOwnerRepo || args.prOwnerRepo) {
+    return
+  }
+  // Why: SSH repo paths are remote-only, so gh cannot use cwd to infer repo
+  // context. Without a resolved owner/repo, running gh would query local state.
+  throw new Error(GITHUB_WORK_ITEMS_SSH_REMOTE_REQUIRED_MESSAGE)
+}
+
 async function listRecentWorkItems(
   repoPath: string,
   issueOwnerRepo: OwnerRepo | null,
   prOwnerRepo: OwnerRepo | null,
   limit: number,
-  connectionId?: string | null
+  connectionId?: string | null,
+  noCache?: boolean
 ): Promise<PartialWorkItemsResult> {
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
-  if (issueOwnerRepo || prOwnerRepo) {
+  const requiresExplicitRepo = Boolean(connectionId)
+  const restCacheArgs = noCache ? [] : ['--cache', '120s']
+  assertSshRepoHasResolvedGitHubSource({ connectionId, issueOwnerRepo, prOwnerRepo })
+  if (issueOwnerRepo || prOwnerRepo || requiresExplicitRepo) {
     // Why: allSettled so a 403 on upstream issues doesn't zero out the origin
     // PR half — the UI renders partial results plus a banner for the failing
     // side, matching the parent design doc's partial-failure rule (§2).
@@ -693,48 +937,50 @@ async function listRecentWorkItems(
         ? ghExecFileAsync(
             [
               'api',
-              '--cache',
-              '120s',
+              ...restCacheArgs,
               `repos/${issueOwnerRepo.owner}/${issueOwnerRepo.repo}/issues?per_page=${limit}&state=open&sort=updated&direction=desc`
             ],
             ghOptions
           )
-        : ghExecFileAsync(
-            [
-              'issue',
-              'list',
-              '--limit',
-              String(limit),
-              '--state',
-              'open',
-              '--json',
-              'number,title,state,url,labels,updatedAt,author'
-            ],
-            ghOptions
-          ),
+        : requiresExplicitRepo
+          ? Promise.resolve({ stdout: '[]' })
+          : ghExecFileAsync(
+              [
+                'issue',
+                'list',
+                '--limit',
+                String(limit),
+                '--state',
+                'open',
+                '--json',
+                WORK_ITEM_ISSUE_LIST_JSON_FIELDS
+              ],
+              ghOptions
+            ),
       prOwnerRepo
         ? ghExecFileAsync(
             [
               'api',
-              '--cache',
-              '120s',
+              ...restCacheArgs,
               `repos/${prOwnerRepo.owner}/${prOwnerRepo.repo}/pulls?per_page=${limit}&state=open&sort=updated&direction=desc`
             ],
             ghOptions
           )
-        : ghExecFileAsync(
-            [
-              'pr',
-              'list',
-              '--limit',
-              String(limit),
-              '--state',
-              'open',
-              '--json',
-              WORK_ITEM_PR_LIST_JSON_FIELDS
-            ],
-            ghOptions
-          )
+        : requiresExplicitRepo
+          ? Promise.resolve({ stdout: '[]' })
+          : ghExecFileAsync(
+              [
+                'pr',
+                'list',
+                '--limit',
+                String(limit),
+                '--state',
+                'open',
+                '--json',
+                WORK_ITEM_PR_LIST_JSON_FIELDS
+              ],
+              ghOptions
+            )
     ])
 
     let issues: MainWorkItem[] = []
@@ -757,8 +1003,9 @@ async function listRecentWorkItems(
     let prs: MainWorkItem[] = []
     if (prsSettled.status === 'fulfilled') {
       prs = (JSON.parse(prsSettled.value.stdout) as Record<string, unknown>[]).map((item) =>
-        mapPullRequestWorkItem(item, prOwnerRepo?.owner ?? null)
+        mapPullRequestWorkItem(item, prOwnerRepo)
       )
+      prs = await hydrateWorkItemMergeMethodSettings(prs, prOwnerRepo, ghOptions)
     } else {
       // Why: PR-side failures must preserve the pre-diff behavior of
       // Promise.all by re-throwing so the rejection propagates up through
@@ -802,7 +1049,7 @@ async function listRecentWorkItems(
         '--state',
         'open',
         '--json',
-        'number,title,state,url,labels,updatedAt,author'
+        WORK_ITEM_ISSUE_LIST_JSON_FIELDS
       ],
       ghOptions
     ),
@@ -843,7 +1090,14 @@ async function listQueriedWorkItems(
   connectionId?: string | null
 ): Promise<PartialWorkItemsResult> {
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
-  const issueScope = query.scope !== 'pr'
+  const requiresExplicitRepo = Boolean(connectionId)
+  assertSshRepoHasResolvedGitHubSource({ connectionId, issueOwnerRepo, prOwnerRepo })
+  const hasPrOnlyFilter =
+    query.state === 'merged' ||
+    query.draft ||
+    query.reviewRequested !== null ||
+    query.reviewedBy !== null
+  const issueScope = query.scope !== 'pr' && !hasPrOnlyFilter
   const prScope = query.scope !== 'issue'
 
   // Why: run the issue and PR fetches in parallel but surface the
@@ -851,6 +1105,9 @@ async function listQueriedWorkItems(
   // failures retain the prior swallow-and-log behavior per parent doc §6.
   const issueFetch = (async (): Promise<PartialWorkItemsResult> => {
     if (!issueScope) {
+      return { items: [] }
+    }
+    if (requiresExplicitRepo && !issueOwnerRepo) {
       return { items: [] }
     }
     const args = buildWorkItemListArgs({
@@ -875,6 +1132,9 @@ async function listQueriedWorkItems(
     if (!prScope) {
       return []
     }
+    if (requiresExplicitRepo && !prOwnerRepo) {
+      return []
+    }
     const args = buildWorkItemListArgs({
       kind: 'pr',
       ownerRepo: prOwnerRepo,
@@ -884,9 +1144,14 @@ async function listQueriedWorkItems(
     })
     try {
       const { stdout } = await ghExecFileAsync(args, ghOptions)
-      return (JSON.parse(stdout) as Record<string, unknown>[]).map((item) =>
-        mapPullRequestWorkItem(item, prOwnerRepo?.owner ?? null)
+      const mapped = (JSON.parse(stdout) as Record<string, unknown>[]).map((item) =>
+        mapPullRequestWorkItem(item, prOwnerRepo)
       )
+      const hydrated = await hydrateWorkItemMergeMethodSettings(mapped, prOwnerRepo, ghOptions)
+      if (query.state === 'closed') {
+        return hydrated.filter((item) => item.state !== 'merged')
+      }
+      return hydrated
     } catch (err) {
       console.warn('listQueriedWorkItems PRs partial failure:', err)
       return []
@@ -906,7 +1171,8 @@ export async function listWorkItems(
   query?: string,
   before?: string,
   preference?: IssueSourcePreference,
-  connectionId?: string | null
+  connectionId?: string | null,
+  noCache?: boolean
 ): Promise<ListWorkItemsResult<MainWorkItem>> {
   // Why: resolve the raw upstream candidate alongside the preference-aware
   // issue source. The selector needs to know whether an upstream remote
@@ -927,7 +1193,14 @@ export async function listWorkItems(
     // catch-all here would make an auth/network failure indistinguishable from
     // an empty result and silently under-report per-repo failures.
     const partial = !trimmedQuery
-      ? await listRecentWorkItems(repoPath, issueOwnerRepo, prOwnerRepo, limit, connectionId)
+      ? await listRecentWorkItems(
+          repoPath,
+          issueOwnerRepo,
+          prOwnerRepo,
+          limit,
+          connectionId,
+          noCache
+        )
       : await listQueriedWorkItems(
           repoPath,
           issueOwnerRepo,
@@ -967,7 +1240,12 @@ function buildSearchQueryString(
   if (query.state === 'open') {
     parts.push('is:open')
   } else if (query.state === 'closed') {
+    // Why: GitHub search treats merged PRs as closed. Exclude merged so the
+    // "Closed" filter actually means closed-without-merge.
     parts.push('is:closed')
+    if (query.scope !== 'issue') {
+      parts.push('-is:merged')
+    }
   } else if (query.state === 'merged') {
     parts.push('is:merged')
   }
@@ -975,24 +1253,28 @@ function buildSearchQueryString(
     parts.push('draft:true')
   }
   if (query.assignee) {
-    parts.push(`assignee:${query.assignee}`)
+    parts.push(`assignee:${quoteGitHubSearchValue(query.assignee)}`)
   }
   if (query.author) {
-    parts.push(`author:${query.author}`)
+    parts.push(`author:${quoteGitHubSearchValue(query.author)}`)
   }
   if (query.reviewRequested) {
-    parts.push(`review-requested:${query.reviewRequested}`)
+    parts.push(`review-requested:${quoteGitHubSearchValue(query.reviewRequested)}`)
   }
   if (query.reviewedBy) {
-    parts.push(`reviewed-by:${query.reviewedBy}`)
+    parts.push(`reviewed-by:${quoteGitHubSearchValue(query.reviewedBy)}`)
   }
   for (const label of query.labels) {
-    parts.push(`label:${label}`)
+    parts.push(`label:${quoteGitHubSearchValue(label)}`)
   }
   if (query.freeText) {
     parts.push(query.freeText)
   }
   return parts.join(' ')
+}
+
+function quoteGitHubSearchValue(value: string): string {
+  return /\s/.test(value) ? `"${value.replaceAll('"', '\\"')}"` : value
 }
 
 async function countWorkItemsForQuery(
@@ -1131,6 +1413,48 @@ export async function getRepoSlug(
   return getOwnerRepo(repoPath, connectionId)
 }
 
+/**
+ * Resolve a fork's upstream/parent owner/repo, or null when the repo is not a
+ * fork. Why: a fork's `origin` points at the personal copy, so repo identity
+ * (notably the avatar) should prefer the upstream. Fast-paths the `upstream`
+ * remote (offline); otherwise asks the GitHub API for the fork parent. The API
+ * call targets the explicit origin slug, so it works for SSH repos too.
+ * Best-effort: any failure (offline, unauthed, non-GitHub) resolves to null.
+ */
+export async function getRepoUpstream(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<OwnerRepo | null> {
+  const origin = await getOwnerRepo(repoPath, connectionId)
+  if (!origin) {
+    return null
+  }
+  const upstreamRemote = await getOwnerRepoForRemote(repoPath, 'upstream', connectionId)
+  if (upstreamRemote && !sameOwnerRepo(upstreamRemote, origin)) {
+    return upstreamRemote
+  }
+  await acquire()
+  try {
+    const { stdout } = await ghExecFileAsync(
+      ['repo', 'view', `${origin.owner}/${origin.repo}`, '--json', 'isFork,parent'],
+      // Why: best-effort fork lookup runs at add-time; cap latency so a stalled
+      // gh process can't hold up repo creation.
+      { ...ghRepoExecOptions(githubRepoContext(repoPath, connectionId)), timeout: 10_000 }
+    )
+    const data = JSON.parse(stdout) as {
+      isFork?: boolean
+      parent?: { name?: string; owner?: { login?: string } } | null
+    }
+    const owner = data.parent?.owner?.login
+    const repo = data.parent?.name
+    return data.isFork && owner && repo ? { owner, repo } : null
+  } catch {
+    return null
+  } finally {
+    release()
+  }
+}
+
 function classifyCreatePRError(error: unknown): CreateHostedReviewResult {
   const { stderr, stdout } = extractExecError(error)
   const message = `${stderr}\n${stdout}`.trim()
@@ -1208,7 +1532,9 @@ async function findOpenPRByHeadBase(args: {
   ownerRepo: OwnerRepo
   head: string
   base: string
+  connectionId?: string | null
 }): Promise<{ number: number; url: string } | null> {
+  const context = githubRepoContext(args.repoPath, args.connectionId)
   const { stdout } = await ghExecFileAsync(
     [
       'pr',
@@ -1226,7 +1552,7 @@ async function findOpenPRByHeadBase(args: {
       '--json',
       'number,url'
     ],
-    { cwd: args.repoPath }
+    ghRepoExecOptions(context)
   )
   const list = JSON.parse(stdout) as { number?: number; url?: string }[]
   if (list.length !== 1 || !list[0]?.number || !list[0]?.url) {
@@ -1235,9 +1561,45 @@ async function findOpenPRByHeadBase(args: {
   return { number: list[0].number, url: list[0].url }
 }
 
+async function readPullRequestTemplate(
+  repoPath: string,
+  connectionId?: string | null
+): Promise<string> {
+  const relativeCandidates = [
+    '.github/pull_request_template.md',
+    '.github/PULL_REQUEST_TEMPLATE.md',
+    'pull_request_template.md',
+    'PULL_REQUEST_TEMPLATE.md',
+    'docs/pull_request_template.md',
+    'docs/PULL_REQUEST_TEMPLATE.md'
+  ]
+  const remoteProvider = connectionId ? getSshFilesystemProvider(connectionId) : undefined
+  if (connectionId && !remoteProvider) {
+    return ''
+  }
+  for (const relativeCandidate of relativeCandidates) {
+    try {
+      if (remoteProvider) {
+        const result = await remoteProvider.readFile(
+          joinWorktreeRelativePath(repoPath, relativeCandidate)
+        )
+        if (result.isBinary) {
+          continue
+        }
+        return result.content
+      }
+      return await readFile(join(repoPath, relativeCandidate), 'utf8')
+    } catch {
+      // Try the next conventional PR template path.
+    }
+  }
+  return ''
+}
+
 export async function createGitHubPullRequest(
   repoPath: string,
-  input: CreateHostedReviewInput
+  input: CreateHostedReviewInput,
+  connectionId?: string | null
 ): Promise<CreateHostedReviewResult> {
   if (input.provider !== 'github') {
     return {
@@ -1247,7 +1609,7 @@ export async function createGitHubPullRequest(
     }
   }
 
-  const ownerRepo = await getOwnerRepo(repoPath)
+  const ownerRepo = await getOwnerRepo(repoPath, connectionId)
   if (!ownerRepo) {
     return {
       ok: false,
@@ -1278,7 +1640,11 @@ export async function createGitHubPullRequest(
   await acquire()
   const bodyPath = join(tempDir, 'body.md')
   try {
-    await writeFile(bodyPath, input.body ?? '', 'utf8')
+    const body =
+      input.useTemplate && !input.body?.trim()
+        ? await readPullRequestTemplate(repoPath, connectionId)
+        : (input.body ?? '')
+    await writeFile(bodyPath, body, 'utf8')
     const createArgs = [
       'pr',
       'create',
@@ -1298,8 +1664,9 @@ export async function createGitHubPullRequest(
       createArgs.push('--draft')
     }
     try {
+      const context = githubRepoContext(repoPath, connectionId)
       const { stdout } = await ghExecFileAsync(createArgs, {
-        cwd: repoPath,
+        ...ghRepoExecOptions(context),
         timeout: 60_000,
         idempotent: false
       })
@@ -1308,7 +1675,9 @@ export async function createGitHubPullRequest(
         return { ok: true, ...created }
       }
       const found = head
-        ? await findOpenPRByHeadBase({ repoPath, ownerRepo, head, base }).catch(() => null)
+        ? await findOpenPRByHeadBase({ repoPath, ownerRepo, head, base, connectionId }).catch(
+            () => null
+          )
         : null
       if (found) {
         return { ok: true, ...found }
@@ -1325,9 +1694,13 @@ export async function createGitHubPullRequest(
         (classified.code === 'already_exists' || classified.code === 'unknown_completion') &&
         head
       ) {
-        const existing = await findOpenPRByHeadBase({ repoPath, ownerRepo, head, base }).catch(
-          () => null
-        )
+        const existing = await findOpenPRByHeadBase({
+          repoPath,
+          ownerRepo,
+          head,
+          base,
+          connectionId
+        }).catch(() => null)
         if (existing) {
           return {
             ok: false,
@@ -1434,6 +1807,12 @@ type PullRequestLookupData = {
   updatedAt: string
   isDraft?: boolean
   mergeable: string
+  reviewDecision?: PRReviewDecision | null
+  autoMergeRequest?: unknown
+  autoMergeEnabled?: boolean
+  mergeQueueRequired?: boolean | null
+  mergeMethodSettings?: GitHubPRMergeMethodSettings
+  mergeStateStatus?: string | null
   baseRefName?: string
   headRefName?: string
   baseRefOid?: string
@@ -1456,6 +1835,8 @@ type RestPullRequest = {
 }
 
 const PR_LOOKUP_JSON_FIELDS =
+  'number,title,state,url,statusCheckRollup,updatedAt,isDraft,mergeable,reviewDecision,mergeStateStatus,autoMergeRequest,baseRefName,headRefName,baseRefOid,headRefOid'
+const PR_BRANCH_LIST_JSON_FIELDS =
   'number,title,state,url,statusCheckRollup,updatedAt,isDraft,mergeable,baseRefName,headRefName,baseRefOid,headRefOid'
 
 function mapRestPRMergeable(pr: RestPullRequest): PRMergeableState {
@@ -1467,6 +1848,14 @@ function mapRestPRMergeable(pr: RestPullRequest): PRMergeableState {
     return 'MERGEABLE'
   }
   return 'UNKNOWN'
+}
+
+function derivePullRequestMergeable(data: PullRequestLookupData): PRMergeableState {
+  const mergeable = normalizePRMergeable(data.mergeable)
+  if (mergeable === 'CONFLICTING' || data.mergeStateStatus === 'DIRTY') {
+    return 'CONFLICTING'
+  }
+  return mergeable ?? 'UNKNOWN'
 }
 
 function mapRestPullRequest(pr: RestPullRequest): PullRequestLookupData {
@@ -1483,6 +1872,155 @@ function mapRestPullRequest(pr: RestPullRequest): PullRequestLookupData {
     headRefName: pr.head?.ref,
     baseRefOid: pr.base?.sha,
     headRefOid: pr.head?.sha
+  }
+}
+
+function normalizePullRequestLookupData(data: PullRequestLookupData): PullRequestLookupData {
+  return {
+    ...data,
+    reviewDecision:
+      data.reviewDecision !== undefined ? normalizeReviewDecision(data.reviewDecision) : undefined,
+    autoMergeEnabled:
+      data.autoMergeEnabled ??
+      ('autoMergeRequest' in data ? isAutoMergeEnabled(data.autoMergeRequest) : undefined)
+  }
+}
+
+function cacheRepositoryMergeMetadata(
+  cacheKey: string,
+  value: GitHubRepositoryMergeMetadata,
+  ttlMs: number
+): void {
+  const now = Date.now()
+  pruneRepositoryMergeMetadataCache(now)
+  // Why: merge metadata is keyed by user-controlled branch names. Keep the
+  // per-session cache bounded even if many short-lived branches are inspected.
+  repositoryMergeMetadataCache.delete(cacheKey)
+  repositoryMergeMetadataCache.set(cacheKey, {
+    value,
+    expiresAt: now + ttlMs
+  })
+  pruneRepositoryMergeMetadataCache(now)
+}
+
+async function detectRepositoryMergeMetadata(
+  ownerRepo: OwnerRepo,
+  branchName: string | undefined,
+  ghOptions: GhExecOptions
+): Promise<GitHubRepositoryMergeMetadata> {
+  const cacheKey = `${ownerRepo.owner.toLowerCase()}/${ownerRepo.repo.toLowerCase()}:${
+    branchName ?? '__repo__'
+  }`
+  pruneRepositoryMergeMetadataCache()
+  const cached = repositoryMergeMetadataCache.get(cacheKey)
+  if (cached) {
+    return cached.value
+  }
+  const guard = rateLimitGuard('graphql')
+  if (guard.blocked) {
+    return { mergeQueueRequired: null }
+  }
+  const query = branchName
+    ? `query($owner: String!, $repo: String!, $branch: String!) {
+    repository(owner: $owner, name: $repo) {
+      viewerDefaultMergeMethod
+      mergeCommitAllowed
+      rebaseMergeAllowed
+      squashMergeAllowed
+      mergeQueue(branch: $branch) { id }
+    }
+  }`
+    : `query($owner: String!, $repo: String!) {
+    repository(owner: $owner, name: $repo) {
+      viewerDefaultMergeMethod
+      mergeCommitAllowed
+      rebaseMergeAllowed
+      squashMergeAllowed
+    }
+  }`
+  try {
+    noteRateLimitSpend('graphql')
+    const args = [
+      'api',
+      'graphql',
+      '-f',
+      `query=${query}`,
+      '-f',
+      `owner=${ownerRepo.owner}`,
+      '-f',
+      `repo=${ownerRepo.repo}`
+    ]
+    if (branchName) {
+      args.push('-f', `branch=${branchName}`)
+    }
+    const { stdout } = await ghExecFileAsync(args, ghOptions)
+    const parsed = JSON.parse(stdout) as {
+      data?: {
+        repository?: {
+          viewerDefaultMergeMethod?: unknown
+          mergeCommitAllowed?: unknown
+          rebaseMergeAllowed?: unknown
+          squashMergeAllowed?: unknown
+          mergeQueue?: { id?: unknown } | null
+        } | null
+      }
+    }
+    const repository = parsed.data?.repository
+    const mergeMethodSettings = repository
+      ? normalizeGitHubPRMergeMethodSettings({
+          defaultMethod: repository.viewerDefaultMergeMethod,
+          mergeCommitAllowed: repository.mergeCommitAllowed,
+          rebaseMergeAllowed: repository.rebaseMergeAllowed,
+          squashMergeAllowed: repository.squashMergeAllowed
+        })
+      : undefined
+    const value: GitHubRepositoryMergeMetadata = {
+      mergeQueueRequired: branchName ? Boolean(repository?.mergeQueue) : null,
+      ...(mergeMethodSettings ? { mergeMethodSettings } : {})
+    }
+    cacheRepositoryMergeMetadata(cacheKey, value, MERGE_QUEUE_CACHE_TTL_MS)
+    return value
+  } catch {
+    // Why: failed merge-queue probes should stay conservative without
+    // retrying GraphQL on every status poll while GitHub/network is unhappy.
+    const value: GitHubRepositoryMergeMetadata = { mergeQueueRequired: null }
+    cacheRepositoryMergeMetadata(cacheKey, value, MERGE_QUEUE_UNKNOWN_CACHE_TTL_MS)
+    return value
+  }
+}
+
+async function hydratePullRequestLookupData(
+  ownerRepo: OwnerRepo,
+  data: PullRequestLookupData,
+  ghOptions: GhExecOptions
+): Promise<PullRequestLookupData> {
+  const normalized = normalizePullRequestLookupData(data)
+  const hasRichMergeFields =
+    'reviewDecision' in data || 'mergeStateStatus' in data || 'autoMergeRequest' in data
+  const mergeMetadata = hasRichMergeFields
+    ? await detectRepositoryMergeMetadata(ownerRepo, normalized.baseRefName, ghOptions)
+    : undefined
+  return {
+    ...normalized,
+    ...(mergeMetadata ? { mergeQueueRequired: mergeMetadata.mergeQueueRequired } : {}),
+    ...(mergeMetadata?.mergeMethodSettings
+      ? { mergeMethodSettings: mergeMetadata.mergeMethodSettings }
+      : {})
+  }
+}
+
+async function hydrateBranchLookupWithExactPR(
+  ownerRepo: OwnerRepo,
+  branchData: PullRequestLookupData | null,
+  ghOptions: GhExecOptions
+): Promise<PullRequestLookupData | null> {
+  if (!branchData) {
+    return null
+  }
+  try {
+    return (await getPRByNumber(ownerRepo, branchData.number, ghOptions)) ?? branchData
+  } catch {
+    return branchData
   }
 }
 
@@ -1520,12 +2058,104 @@ async function getFallbackPRListForBranch(
       '--limit',
       '1',
       '--json',
-      PR_LOOKUP_JSON_FIELDS
+      PR_BRANCH_LIST_JSON_FIELDS
     ],
     ghOptions
   )
   const list = JSON.parse(stdout) as PullRequestLookupData[]
   return list[0] ?? null
+}
+
+type TrackedUpstreamBranch = {
+  remoteName: string
+  branchName: string
+}
+
+function parseTrackedUpstreamBranch(
+  upstreamRef: string,
+  branchName: string
+): TrackedUpstreamBranch | null {
+  const parsed = splitRemoteBranchName(upstreamRef.trim())
+  if (!parsed || parsed.branchName === branchName) {
+    return null
+  }
+  return parsed
+}
+
+async function getTrackedUpstreamBranch(
+  repoPath: string,
+  branchName: string,
+  connectionId?: string | null
+): Promise<TrackedUpstreamBranch | null> {
+  const args = ['rev-parse', '--abbrev-ref', '--symbolic-full-name', `${branchName}@{upstream}`]
+  try {
+    const provider = connectionId ? getSshGitProvider(connectionId) : null
+    const result = provider
+      ? await provider.exec(args, repoPath)
+      : await gitExecFileAsync(args, { cwd: repoPath })
+    return parseTrackedUpstreamBranch(result.stdout, branchName)
+  } catch {
+    return null
+  }
+}
+
+async function lookupPRByBranchName(args: {
+  candidates: OwnerRepo[]
+  headRepo: OwnerRepo | null
+  branchName: string
+  ghOptions: GhExecOptions
+}): Promise<{ data: PullRequestLookupData | null; dataRepo: OwnerRepo | null }> {
+  if (args.candidates.length > 0) {
+    for (const candidate of args.candidates) {
+      try {
+        const branchData = args.headRepo
+          ? await getRestPRForBranch(
+              candidate,
+              args.headRepo.owner,
+              args.branchName,
+              args.ghOptions
+            )
+          : await getFallbackPRListForBranch(candidate, args.branchName, args.ghOptions)
+        // Why: REST/list branch lookup identifies the PR cheaply; exact
+        // `gh pr view` carries review, merge queue, and auto-merge state.
+        const data = await hydrateBranchLookupWithExactPR(candidate, branchData, args.ghOptions)
+        if (data) {
+          return { data, dataRepo: candidate }
+        }
+      } catch (err) {
+        if (args.headRepo) {
+          throw err
+        }
+        const branchData = await getRestPRForBranch(
+          candidate,
+          candidate.owner,
+          args.branchName,
+          args.ghOptions
+        )
+        const data = await hydrateBranchLookupWithExactPR(candidate, branchData, args.ghOptions)
+        if (data) {
+          return { data, dataRepo: candidate }
+        }
+      }
+    }
+    return { data: null, dataRepo: null }
+  }
+
+  try {
+    const { stdout } = await ghExecFileAsync(
+      ['pr', 'view', args.branchName, '--json', PR_LOOKUP_JSON_FIELDS],
+      args.ghOptions
+    )
+    return {
+      data: normalizePullRequestLookupData(JSON.parse(stdout) as PullRequestLookupData),
+      dataRepo: null
+    }
+  } catch (err) {
+    if (isNoPullRequestError(err)) {
+      return { data: null, dataRepo: null }
+    }
+    throw err
+  }
 }
 
 async function getRestPRByNumber(
@@ -1558,7 +2188,11 @@ async function getPRByNumber(
       ],
       ghOptions
     )
-    return JSON.parse(stdout) as PullRequestLookupData
+    return hydratePullRequestLookupData(
+      ownerRepo,
+      JSON.parse(stdout) as PullRequestLookupData,
+      ghOptions
+    )
   } catch (err) {
     // Why: deleted or manually edited linked PR metadata should fall back to
     // branch discovery; quota/auth/network failures get one cheaper REST exact lookup.
@@ -1566,7 +2200,8 @@ async function getPRByNumber(
       return null
     }
     try {
-      return await getRestPRByNumber(ownerRepo, number, ghOptions)
+      const restData = await getRestPRByNumber(ownerRepo, number, ghOptions)
+      return restData ? hydratePullRequestLookupData(ownerRepo, restData, ghOptions) : null
     } catch (restErr) {
       if (isNotFoundGhError(restErr)) {
         return null
@@ -1579,21 +2214,47 @@ async function getPRByNumber(
   }
 }
 
-async function exactPRMatchesWorktreeHead(
-  repoPath: string,
-  branchName: string,
-  data: PullRequestLookupData,
-  connectionId?: string | null
-): Promise<boolean> {
-  if (!connectionId && data.headRefOid) {
+async function lookupPRByNumber(args: {
+  candidates: OwnerRepo[]
+  number: number
+  ghOptions: ReturnType<typeof ghRepoExecOptions>
+}): Promise<{ data: PullRequestLookupData | null; dataRepo: OwnerRepo | null }> {
+  for (const candidate of args.candidates) {
     try {
-      const { stdout } = await gitExecFileAsync(['rev-parse', 'HEAD'], { cwd: repoPath })
-      return stdout.trim() === data.headRefOid
-    } catch {
-      return false
+      const linkedData = await getPRByNumber(candidate, args.number, args.ghOptions)
+      if (!linkedData) {
+        continue
+      }
+      return { data: linkedData, dataRepo: candidate }
+    } catch (err) {
+      if (shouldStopAfterExactLookupError(err)) {
+        throw err
+      }
+      // Candidate probing is best-effort; another repo may own the PR.
     }
   }
-  return !branchName || data.headRefName === branchName
+
+  if (args.candidates.length > 0) {
+    return { data: null, dataRepo: null }
+  }
+
+  try {
+    const { stdout } = await ghExecFileAsync(
+      ['pr', 'view', String(args.number), '--json', PR_LOOKUP_JSON_FIELDS],
+      args.ghOptions
+    )
+    return {
+      data: normalizePullRequestLookupData(JSON.parse(stdout) as PullRequestLookupData),
+      dataRepo: null
+    }
+  } catch (err) {
+    if (isNoPullRequestError(err)) {
+      // Why: stale cached fallback numbers should not turn every poll into an
+      // error when the PR was deleted or belonged to a different repo.
+      return { data: null, dataRepo: null }
+    }
+    throw err
+  }
 }
 
 function isNotFoundGhError(err: unknown): boolean {
@@ -1604,28 +2265,50 @@ function isNotFoundGhError(err: unknown): boolean {
 function shouldStopAfterExactLookupError(err: unknown): boolean {
   const stderr = err instanceof Error ? err.message : String(err)
   const type = classifyGhError(stderr).type
-  return type === 'rate_limited' || type === 'permission_denied' || type === 'network_error'
+  return type !== 'not_found'
 }
 
 /**
  * Get PR info for a given branch using gh CLI.
  * Returns null if gh is not installed, or no PR exists for the branch.
  *
- * When `linkedPRNumber` is provided and the repo identity is known, starts
- * with a direct PR-number lookup. This handles "create from PR" worktrees,
- * whose branch is a fresh local branch, and avoids spending a branch-list
- * request before asking for the exact PR the worktree already stores.
+ * When `linkedPRNumber` is provided, it is the source of truth. This handles
+ * "create from PR" worktrees whose local branch differs from the PR head ref,
+ * and prevents a coalesced linked-PR refresh from fanning out an unrelated
+ * branch lookup result to sibling aliases.
+ * `fallbackPRNumber` is weaker: branch lookup still wins, and exact lookup is
+ * used only after branch lookup misses.
  */
 export async function getPRForBranch(
   repoPath: string,
   branch: string,
   linkedPRNumber?: number | null,
-  connectionId?: string | null
+  connectionId?: string | null,
+  fallbackPRNumber?: number | null
 ): Promise<PRInfo | null> {
+  const outcome = await getPRForBranchOutcome(
+    repoPath,
+    branch,
+    linkedPRNumber,
+    connectionId,
+    fallbackPRNumber
+  )
+  return outcome.kind === 'found' ? outcome.pr : null
+}
+
+export async function getPRForBranchOutcome(
+  repoPath: string,
+  branch: string,
+  linkedPRNumber?: number | null,
+  connectionId?: string | null,
+  fallbackPRNumber?: number | null
+): Promise<PRRefreshOutcome> {
   // Strip refs/heads/ prefix if present
   const branchName = branch.replace(/^refs\/heads\//, '')
-  if (!branchName && typeof linkedPRNumber !== 'number') {
-    return null
+  // Why: detached HEAD cannot use branch lookup, but an exact linked/fallback
+  // PR number remains safe to query and keeps review state visible.
+  if (!branchName && typeof linkedPRNumber !== 'number' && typeof fallbackPRNumber !== 'number') {
+    return { kind: 'no-pr', fetchedAt: Date.now() }
   }
   const context = githubRepoContext(repoPath, connectionId)
   const ghOptions = ghRepoExecOptions(context)
@@ -1635,94 +2318,66 @@ export async function getPRForBranch(
     const { candidates, headRepo } = await resolvePRRepositoryCandidates(repoPath, connectionId)
     let data: PullRequestLookupData | null = null
     let dataRepo: OwnerRepo | null = null
-    let exactLinkedData: PullRequestLookupData | null = null
-    let exactLinkedRepo: OwnerRepo | null = null
+    let dataHeadRepo: OwnerRepo | null = headRepo
 
     if (typeof linkedPRNumber === 'number') {
-      for (const candidate of candidates) {
-        try {
-          const linkedData = await getPRByNumber(candidate, linkedPRNumber, ghOptions)
-          if (!linkedData) {
-            continue
-          }
-          if (await exactPRMatchesWorktreeHead(repoPath, branchName, linkedData, connectionId)) {
-            data = linkedData
-            dataRepo = candidate
-            break
-          }
-          // Why: linked PR metadata is user-editable. If the stored number still
-          // resolves but no longer matches this worktree, let branch lookup correct it.
-          exactLinkedData ??= linkedData
-          exactLinkedRepo ??= candidate
-        } catch {
-          // Candidate probing is best-effort; another repo may own the PR.
-        }
-      }
-    }
-
-    // During a rebase the worktree is in detached HEAD and branch is empty.
-    // An empty --head filter causes gh to return an arbitrary PR — skip the
-    // branch lookup and rely on the linkedPR fallback below if available.
-    if (!data && branchName) {
-      if (candidates.length > 0) {
-        for (const candidate of candidates) {
-          try {
-            data = headRepo
-              ? await getRestPRForBranch(candidate, headRepo.owner, branchName, ghOptions)
-              : await getFallbackPRListForBranch(candidate, branchName, ghOptions)
-            if (data) {
-              dataRepo = candidate
-              break
-            }
-          } catch (err) {
-            if (!headRepo && !isNotFoundGhError(err)) {
-              try {
-                data = await getRestPRForBranch(candidate, candidate.owner, branchName, ghOptions)
-                if (data) {
-                  dataRepo = candidate
-                  break
-                }
-              } catch {
-                // Continue to the next candidate below.
-              }
-            }
+      const exactLookup = await lookupPRByNumber({
+        candidates,
+        number: linkedPRNumber,
+        ghOptions
+      })
+      data = exactLookup.data
+      dataRepo = exactLookup.dataRepo
+    } else if (branchName) {
+      // During a rebase the worktree is in detached HEAD and branch is empty.
+      // An empty --head filter causes gh to return an arbitrary PR.
+      const branchLookup = await lookupPRByBranchName({
+        candidates,
+        headRepo,
+        branchName,
+        ghOptions
+      })
+      data = branchLookup.data
+      dataRepo = branchLookup.dataRepo
+      if (!data) {
+        // Why: worktrees can have a short local branch tracking a differently
+        // named remote PR head; after the local miss, try that configured head.
+        const upstreamBranch = await getTrackedUpstreamBranch(repoPath, branchName, connectionId)
+        if (upstreamBranch) {
+          const upstreamHeadRepo =
+            (await getOwnerRepoForRemote(repoPath, upstreamBranch.remoteName, connectionId)) ??
+            headRepo
+          const upstreamLookup = await lookupPRByBranchName({
+            candidates,
+            headRepo: upstreamHeadRepo,
+            branchName: upstreamBranch.branchName,
+            ghOptions
+          })
+          data = upstreamLookup.data
+          dataRepo = upstreamLookup.dataRepo
+          if (data) {
+            dataHeadRepo = upstreamHeadRepo
           }
         }
-      } else {
-        const { stdout } = await ghExecFileAsync(
-          ['pr', 'view', branchName, '--json', PR_LOOKUP_JSON_FIELDS],
-          ghOptions
-        )
-        data = JSON.parse(stdout)
       }
     }
-
-    if (!data && candidates.length === 0 && typeof linkedPRNumber === 'number') {
-      const args = ['pr', 'view', String(linkedPRNumber), '--json', PR_LOOKUP_JSON_FIELDS]
-      try {
-        const { stdout } = await ghExecFileAsync(args, ghOptions)
-        data = JSON.parse(stdout)
-      } catch {
-        // Why: a stale linkedPRNumber (PR deleted, wrong repo, …) makes
-        // `gh pr view <number>` reject. Treat that as the no-PR case so
-        // callers see the historical `null` semantics instead of a thrown
-        // error every poll cycle.
-        data = null
-      }
+    if (!data && typeof linkedPRNumber !== 'number' && typeof fallbackPRNumber === 'number') {
+      const fallbackLookup = await lookupPRByNumber({
+        candidates,
+        number: fallbackPRNumber,
+        ghOptions
+      })
+      data = fallbackLookup.data
+      dataRepo = fallbackLookup.dataRepo
     }
-
-    if (!data && exactLinkedData) {
-      data = exactLinkedData
-      dataRepo = exactLinkedRepo
-    }
-
     if (!data) {
-      return null
+      return { kind: 'no-pr', fetchedAt: Date.now() }
     }
 
+    const mergeable = derivePullRequestMergeable(data)
     const conflictSummary =
       !connectionId &&
-      data.mergeable === 'CONFLICTING' &&
+      mergeable === 'CONFLICTING' &&
       data.baseRefName &&
       data.baseRefOid &&
       data.headRefOid
@@ -1730,20 +2385,33 @@ export async function getPRForBranch(
         : undefined
 
     return {
-      number: data.number,
-      title: data.title,
-      state: mapPRState(data.state, data.isDraft),
-      url: data.url,
-      checksStatus: deriveCheckStatus(data.statusCheckRollup),
-      updatedAt: data.updatedAt,
-      mergeable: (data.mergeable as PRMergeableState) ?? 'UNKNOWN',
-      headSha: data.headRefOid,
-      prRepo: dataRepo ?? undefined,
-      headRepo: headRepo ?? undefined,
-      conflictSummary
+      kind: 'found',
+      fetchedAt: Date.now(),
+      pr: {
+        number: data.number,
+        title: data.title,
+        state: mapPRState(data.state, data.isDraft),
+        url: data.url,
+        checksStatus: deriveCheckStatus(data.statusCheckRollup),
+        updatedAt: data.updatedAt,
+        mergeable,
+        ...(data.reviewDecision !== undefined ? { reviewDecision: data.reviewDecision } : {}),
+        ...(data.autoMergeEnabled !== undefined ? { autoMergeEnabled: data.autoMergeEnabled } : {}),
+        ...(data.mergeQueueRequired !== undefined
+          ? { mergeQueueRequired: data.mergeQueueRequired }
+          : {}),
+        ...(data.mergeMethodSettings !== undefined
+          ? { mergeMethodSettings: data.mergeMethodSettings }
+          : {}),
+        ...(data.mergeStateStatus !== undefined ? { mergeStateStatus: data.mergeStateStatus } : {}),
+        headSha: data.headRefOid,
+        prRepo: dataRepo ?? undefined,
+        headRepo: dataHeadRepo ?? undefined,
+        conflictSummary
+      }
     }
-  } catch {
-    return null
+  } catch (err) {
+    return prRefreshUpstreamError(err)
   } finally {
     release()
   }
@@ -1765,27 +2433,54 @@ export async function getPRChecks(
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
   const ownerRepo = prRepo ?? (await getOwnerRepo(repoPath, connectionId))
   const fallbackToPRChecks = async (): Promise<PRCheckDetail[]> => {
-    const fallbackArgs = ['pr', 'checks', String(prNumber), '--json', 'name,state,link']
-    if (ownerRepo) {
-      fallbackArgs.push('--repo', `${ownerRepo.owner}/${ownerRepo.repo}`)
+    // Why: the REST check-runs path spends core only. Guard GraphQL only when
+    // we actually fall back to `gh pr checks`, so a low GraphQL bucket does not
+    // block fresh REST check data. Keep this outside the gh lock because the
+    // guard may need its own `gh api rate_limit` call.
+    await assertRateLimitBudget('graphql')
+    await acquire()
+    try {
+      const fallbackArgs = ['pr', 'checks', String(prNumber), '--json', 'name,state,link']
+      if (ownerRepo) {
+        fallbackArgs.push('--repo', `${ownerRepo.owner}/${ownerRepo.repo}`)
+      }
+      const { stdout } = await ghExecFileAsync(fallbackArgs, ghOptions).catch((err: unknown) => {
+        const { stderr } = extractExecError(err)
+        // Why: `gh pr checks` exits non-zero when a PR genuinely has no check
+        // runs yet. Treat that as an empty optional section, not a load failure.
+        if (stderr.toLowerCase().includes('no checks reported')) {
+          return { stdout: '[]', stderr }
+        }
+        throw err
+      })
+      noteRateLimitSpend('graphql')
+      const data = JSON.parse(stdout) as { name: string; state: string; link: string }[]
+      return data.map((d) => ({
+        name: d.name,
+        status: mapCheckStatus(d.state),
+        conclusion: mapCheckConclusion(d.state),
+        url: d.link || null,
+        workflowRunId: parseActionsRunId(d.link)
+      }))
+    } finally {
+      release()
     }
-    const { stdout } = await ghExecFileAsync(fallbackArgs, ghOptions)
-    const data = JSON.parse(stdout) as { name: string; state: string; link: string }[]
-    return data.map((d) => ({
-      name: d.name,
-      status: mapCheckStatus(d.state),
-      conclusion: mapCheckConclusion(d.state),
-      url: d.link || null,
-      workflowRunId: parseActionsRunId(d.link)
-    }))
   }
-  await acquire()
-  try {
-    if (ownerRepo && headSha) {
-      // Why: --cache 60s saves rate-limit budget during polling, but when the
-      // user explicitly clicks refresh we must skip it so gh fetches fresh data.
-      const cacheArgs = options?.noCache ? [] : ['--cache', '60s']
+
+  if (ownerRepo && headSha) {
+    let canUseRestChecks = true
+    try {
+      await assertRateLimitBudget('core')
+    } catch (err) {
+      canUseRestChecks = false
+      console.warn('getPRChecks skipped REST check-runs, falling back to gh pr checks:', err)
+    }
+    if (canUseRestChecks) {
+      await acquire()
       try {
+        // Why: --cache 60s saves rate-limit budget during polling, but when the
+        // user explicitly clicks refresh we must skip it so gh fetches fresh data.
+        const cacheArgs = options?.noCache ? [] : ['--cache', '60s']
         const { stdout } = await ghExecFileAsync(
           [
             'api',
@@ -1794,6 +2489,7 @@ export async function getPRChecks(
           ],
           ghOptions
         )
+        noteRateLimitSpend('core')
         const data = JSON.parse(stdout) as {
           check_runs: {
             id?: number
@@ -1804,29 +2500,243 @@ export async function getPRChecks(
             details_url: string | null
           }[]
         }
-        if (data.check_runs.length === 0) {
-          return fallbackToPRChecks()
+        if (data.check_runs.length > 0) {
+          return data.check_runs.map((d) => ({
+            name: d.name,
+            status: mapCheckRunRESTStatus(d.status),
+            conclusion: mapCheckRunRESTConclusion(d.status, d.conclusion),
+            url: d.details_url || d.html_url || null,
+            ...(typeof d.id === 'number' ? { checkRunId: d.id } : {}),
+            workflowRunId: parseActionsRunId(d.details_url || d.html_url || null)
+          }))
         }
-        return data.check_runs.map((d) => ({
-          name: d.name,
-          status: mapCheckRunRESTStatus(d.status),
-          conclusion: mapCheckRunRESTConclusion(d.status, d.conclusion),
-          url: d.details_url || d.html_url || null,
-          ...(typeof d.id === 'number' ? { checkRunId: d.id } : {}),
-          workflowRunId: parseActionsRunId(d.details_url || d.html_url || null)
-        }))
       } catch (err) {
         // Why: a PR can outlive the cached head SHA after force-pushes or remote
         // rewrites. Falling back to `gh pr checks` keeps the panel populated
         // instead of rendering a false "no checks" state from a stale commit.
         console.warn('getPRChecks via head SHA failed, falling back to gh pr checks:', err)
+      } finally {
+        release()
       }
     }
-    // Fallback: no branch provided, empty check-runs, or non-GitHub remote.
-    return fallbackToPRChecks()
+  }
+
+  try {
+    return await fallbackToPRChecks()
   } catch (err) {
     console.warn('getPRChecks failed:', err)
+    throw err
+  }
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function mapCheckAnnotations(raw: unknown): PRCheckRunDetails['annotations'] {
+  if (!Array.isArray(raw)) {
     return []
+  }
+  return raw
+    .filter((annotation): annotation is Record<string, unknown> => Boolean(annotation))
+    .map((annotation) => ({
+      path: nullableString(annotation.path),
+      startLine: nullableNumber(annotation.start_line),
+      endLine: nullableNumber(annotation.end_line),
+      annotationLevel: nullableString(annotation.annotation_level),
+      title: nullableString(annotation.title),
+      message: nullableString(annotation.message) ?? '',
+      rawDetails: nullableString(annotation.raw_details)
+    }))
+}
+
+function mapWorkflowJobs(raw: unknown, checkName?: string): PRCheckRunDetails['jobs'] {
+  if (!raw || typeof raw !== 'object' || !Array.isArray((raw as { jobs?: unknown }).jobs)) {
+    return []
+  }
+  const jobs = (raw as { jobs: unknown[] }).jobs
+    .filter((job): job is Record<string, unknown> => Boolean(job))
+    .map((job) => ({
+      id: nullableNumber(job.id),
+      name: nullableString(job.name) ?? 'Unnamed job',
+      status: nullableString(job.status),
+      conclusion: nullableString(job.conclusion),
+      startedAt: nullableString(job.started_at),
+      completedAt: nullableString(job.completed_at),
+      url: nullableString(job.html_url),
+      logTail: null,
+      steps: Array.isArray(job.steps)
+        ? job.steps
+            .filter((step): step is Record<string, unknown> => Boolean(step))
+            .map((step) => ({
+              name: nullableString(step.name) ?? 'Unnamed step',
+              status: nullableString(step.status),
+              conclusion: nullableString(step.conclusion),
+              startedAt: nullableString(step.started_at),
+              completedAt: nullableString(step.completed_at)
+            }))
+        : []
+    }))
+  const exactMatches = checkName ? jobs.filter((job) => job.name === checkName) : []
+  return exactMatches.length > 0 ? exactMatches : jobs
+}
+
+function isCheckJobFailureState(state: string | null | undefined): boolean {
+  return state === 'failure' || state === 'failed' || state === 'cancelled' || state === 'timed_out'
+}
+
+function sliceCheckLogTail(logText: string): string {
+  const lineTail = logText.split(/\r?\n/).slice(-PR_CHECK_LOG_TAIL_LINES).join('\n')
+  const bytes = Buffer.from(lineTail, 'utf8')
+  if (bytes.byteLength <= PR_CHECK_LOG_TAIL_BYTES) {
+    return lineTail
+  }
+  return bytes.subarray(bytes.byteLength - PR_CHECK_LOG_TAIL_BYTES).toString('utf8')
+}
+
+function getCheckJobLogTailCacheKey(job: PRCheckRunDetails['jobs'][number]): string | null {
+  if (job.id === null) {
+    return null
+  }
+  return `${job.id}:${job.completedAt ?? ''}`
+}
+
+async function attachFailedJobLogTails(
+  jobs: PRCheckRunDetails['jobs'],
+  ownerRepo: OwnerRepo,
+  ghOptions: GhExecOptions
+): Promise<void> {
+  const failedJobs = jobs
+    .filter((job) => {
+      const state = job.conclusion ?? job.status
+      return job.id !== null && isCheckJobFailureState(state)
+    })
+    .slice(0, PR_CHECK_LOG_TAIL_JOB_LIMIT)
+
+  // Why: failed workflows can have many jobs; cap log fetches so details remain
+  // a lazy, bounded follow-up request instead of a burst of hosted log downloads.
+  for (const job of failedJobs) {
+    const cacheKey = getCheckJobLogTailCacheKey(job)
+    if (!cacheKey) {
+      continue
+    }
+    if (prCheckLogTailCache.has(cacheKey)) {
+      job.logTail = prCheckLogTailCache.get(cacheKey) ?? null
+      continue
+    }
+    try {
+      const { stdout } = await ghExecFileAsync(
+        ['api', `repos/${ownerRepo.owner}/${ownerRepo.repo}/actions/jobs/${job.id}/logs`],
+        ghOptions
+      )
+      job.logTail = sliceCheckLogTail(stdout)
+    } catch (err) {
+      console.warn('getPRCheckDetails workflow job log fetch failed:', err)
+      job.logTail = null
+    }
+    setPrCheckLogTailCache(cacheKey, job.logTail)
+  }
+}
+
+function getWorkflowRunIdFromCheckRun(
+  checkRun: Record<string, unknown> | null
+): number | undefined {
+  const checkSuite = checkRun?.check_suite
+  if (!checkSuite || typeof checkSuite !== 'object') {
+    return undefined
+  }
+  const workflowRun = (checkSuite as { workflow_run?: unknown }).workflow_run
+  if (!workflowRun || typeof workflowRun !== 'object') {
+    return undefined
+  }
+  const id = (workflowRun as { id?: unknown }).id
+  return typeof id === 'number' && Number.isSafeInteger(id) ? id : undefined
+}
+
+export async function getPRCheckDetails(
+  repoPath: string,
+  args: {
+    checkRunId?: number
+    workflowRunId?: number
+    checkName?: string
+    url?: string | null
+    prRepo?: OwnerRepo | null
+  },
+  connectionId?: string | null
+): Promise<PRCheckRunDetails | null> {
+  const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
+  const ownerRepo = args.prRepo ?? (await getOwnerRepo(repoPath, connectionId))
+  if (!ownerRepo) {
+    return null
+  }
+
+  await acquire()
+  try {
+    let checkRun: Record<string, unknown> | null = null
+    let annotations: PRCheckRunDetails['annotations'] = []
+    if (args.checkRunId) {
+      const { stdout } = await ghExecFileAsync(
+        ['api', `repos/${ownerRepo.owner}/${ownerRepo.repo}/check-runs/${args.checkRunId}`],
+        ghOptions
+      )
+      checkRun = JSON.parse(stdout) as Record<string, unknown>
+      try {
+        const annotationsResult = await ghExecFileAsync(
+          [
+            'api',
+            `repos/${ownerRepo.owner}/${ownerRepo.repo}/check-runs/${args.checkRunId}/annotations?per_page=20`
+          ],
+          ghOptions
+        )
+        annotations = mapCheckAnnotations(JSON.parse(annotationsResult.stdout))
+      } catch (err) {
+        console.warn('getPRCheckDetails annotations fetch failed:', err)
+      }
+    }
+
+    const workflowRunId = args.workflowRunId ?? getWorkflowRunIdFromCheckRun(checkRun)
+    let jobs: PRCheckRunDetails['jobs'] = []
+    if (workflowRunId) {
+      try {
+        const { stdout } = await ghExecFileAsync(
+          [
+            'api',
+            `repos/${ownerRepo.owner}/${ownerRepo.repo}/actions/runs/${workflowRunId}/jobs?per_page=100`
+          ],
+          ghOptions
+        )
+        jobs = mapWorkflowJobs(JSON.parse(stdout), args.checkName)
+        await attachFailedJobLogTails(jobs, ownerRepo, ghOptions)
+      } catch (err) {
+        console.warn('getPRCheckDetails workflow jobs fetch failed:', err)
+      }
+    }
+
+    const output =
+      checkRun?.output && typeof checkRun.output === 'object'
+        ? (checkRun.output as Record<string, unknown>)
+        : null
+    return {
+      name: nullableString(checkRun?.name) ?? args.checkName ?? 'Check',
+      status: nullableString(checkRun?.status),
+      conclusion: nullableString(checkRun?.conclusion),
+      url: nullableString(checkRun?.html_url) ?? args.url ?? null,
+      detailsUrl: nullableString(checkRun?.details_url) ?? args.url ?? null,
+      startedAt: nullableString(checkRun?.started_at),
+      completedAt: nullableString(checkRun?.completed_at),
+      title: nullableString(output?.title),
+      summary: nullableString(output?.summary),
+      text: nullableString(output?.text),
+      annotations,
+      jobs
+    }
+  } catch (err) {
+    console.warn('getPRCheckDetails failed:', err)
+    return null
   } finally {
     release()
   }
@@ -1990,6 +2900,9 @@ export async function getPRComments(
 ): Promise<PRComment[]> {
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
   const ownerRepo = options?.prRepo ?? (await getOwnerRepo(repoPath, connectionId))
+  if (ownerRepo) {
+    await assertRateLimitBudget('core')
+  }
   await acquire()
   try {
     if (ownerRepo) {
@@ -2039,6 +2952,7 @@ export async function getPRComments(
           ghOptions
         )
       ])
+      noteRateLimitSpend('core', 2)
 
       // Parse issue comments (REST)
       type RESTComment = {
@@ -2137,6 +3051,7 @@ export async function getPRComments(
               path: c.path,
               threadId: thread.id,
               isResolved: thread.isResolved,
+              isOutdated: thread.line == null,
               // Why: GitHub nulls out line/startLine when the commented code is
               // outdated (e.g. after a force-push). Fall back to originalLine which
               // always preserves the line numbers from when the comment was created.
@@ -2190,6 +3105,7 @@ export async function getPRComments(
       ['pr', 'view', String(prNumber), '--json', 'comments'],
       ghOptions
     )
+    noteRateLimitSpend('graphql')
     const data = JSON.parse(stdout) as {
       comments: {
         author: { login: string }
@@ -2329,10 +3245,11 @@ export async function addPRReviewCommentReply(
   threadId?: string,
   path?: string,
   line?: number,
-  connectionId?: string | null
+  connectionId?: string | null,
+  prRepo?: OwnerRepo | null
 ): Promise<GitHubCommentResult> {
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
-  const ownerRepo = await getOwnerRepo(repoPath, connectionId)
+  const ownerRepo = prRepo ?? (await getOwnerRepo(repoPath, connectionId))
   if (!ownerRepo) {
     return { ok: false, error: 'Could not resolve GitHub owner/repo for this repository' }
   }
@@ -2349,9 +3266,13 @@ export async function addPRReviewCommentReply(
       ],
       ghOptions
     )
+    const data = JSON.parse(stdout) as Parameters<typeof mapReviewCommentResponse>[0]
+    if (typeof data.id !== 'number' || !Number.isSafeInteger(data.id) || data.id < 1) {
+      return { ok: false, error: 'Unexpected response from GitHub' }
+    }
     return {
       ok: true,
-      comment: mapReviewCommentResponse(JSON.parse(stdout), body, path, line, undefined, threadId)
+      comment: mapReviewCommentResponse(data, body, path, line, undefined, threadId)
     }
   } catch (err) {
     const stderr = err instanceof Error ? err.message : String(err)
@@ -2429,6 +3350,17 @@ export async function mergePR(
   const ownerRepo = prRepo ?? (await getOwnerRepo(repoPath, connectionId))
   await acquire()
   try {
+    const mergeBlocker = await getPRMergeBlocker(
+      repoPath,
+      prNumber,
+      ownerRepo,
+      ghOptions,
+      connectionId
+    )
+    if (mergeBlocker) {
+      return { ok: false, error: mergeBlocker }
+    }
+
     // Don't use --delete-branch: it tries to delete the local branch which
     // fails when the user's worktree is checked out on it. Branch cleanup
     // is handled by worktree deletion (local) and GitHub's auto-delete setting (remote).
@@ -2450,6 +3382,100 @@ export async function mergePR(
   }
 }
 
+export async function setPRAutoMerge(
+  repoPath: string,
+  prNumber: number,
+  enabled: boolean,
+  connectionId?: string | null,
+  prRepo?: OwnerRepo | null
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
+  const ownerRepo = prRepo ?? (await getOwnerRepo(repoPath, connectionId))
+  await acquire()
+  try {
+    const args = ['pr', 'merge', String(prNumber), enabled ? '--auto' : '--disable-auto']
+    if (ownerRepo) {
+      args.push('--repo', `${ownerRepo.owner}/${ownerRepo.repo}`)
+    }
+    await ghExecFileAsync(args, {
+      ...ghOptions,
+      env: { ...process.env, GH_PROMPT_DISABLED: '1' }
+    })
+    return { ok: true }
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : typeof err === 'string' ? err : 'Unknown error'
+    return { ok: false, error: classifyGhError(message).message }
+  } finally {
+    release()
+  }
+}
+
+async function getPRMergeBlocker(
+  repoPath: string,
+  prNumber: number,
+  ownerRepo: OwnerRepo | null,
+  ghOptions: GhExecOptions,
+  connectionId?: string | null
+): Promise<string | null> {
+  if (!ownerRepo) {
+    return null
+  }
+
+  try {
+    const pr = await getPRByNumber(ownerRepo, prNumber, ghOptions)
+    if (!pr) {
+      return null
+    }
+    if (pr.reviewDecision === 'REVIEW_REQUIRED') {
+      return 'This pull request requires review approval before it can be merged.'
+    }
+    if (pr.reviewDecision === 'CHANGES_REQUESTED') {
+      return 'This pull request has requested changes and cannot be merged yet.'
+    }
+    if (pr.mergeQueueRequired === true) {
+      return 'This pull request must be merged through GitHub merge queue. Use Merge when ready instead.'
+    }
+    // Why: conflict summaries shell out to local git; SSH repo paths are remote-only
+    // until that helper is routed through the SSH git provider.
+    if (
+      connectionId ||
+      pr.mergeable !== 'CONFLICTING' ||
+      !pr.baseRefName ||
+      !pr.baseRefOid ||
+      !pr.headRefOid
+    ) {
+      return null
+    }
+
+    const summary = await getPRConflictSummary(
+      repoPath,
+      pr.baseRefName,
+      pr.baseRefOid,
+      pr.headRefOid
+    )
+    return formatMergeConflictBlocker(pr.baseRefName, summary)
+  } catch {
+    // Why: conflict preflight should improve stale UI diagnostics, not make
+    // merge impossible when the lookup endpoint has a transient failure.
+    return null
+  }
+}
+
+function formatMergeConflictBlocker(
+  baseRefName: string,
+  summary: PRConflictSummary | undefined
+): string {
+  const heading = 'This pull request has merge conflicts and cannot be merged yet.'
+  if (!summary || summary.files.length === 0) {
+    return `${heading}\nUpdate the branch with ${baseRefName} and resolve the conflicts before merging.`
+  }
+
+  const files = summary.files.map((file) => `- ${file}`).join('\n')
+  const behind = `${summary.commitsBehind} commit${summary.commitsBehind === 1 ? '' : 's'} behind ${baseRefName}`
+  return `${heading}\n${behind} (base commit: ${summary.baseCommit}).\n\nConflicting files:\n${files}`
+}
+
 export async function updatePRState(
   repoPath: string,
   prNumber: number,
@@ -2465,16 +3491,14 @@ export async function updatePRState(
 
   await acquire()
   try {
+    const cmd = updates.state === 'closed' ? 'close' : 'reopen'
+    // Why: GitHub can reject REST pull state PATCHes for reopen paths with a
+    // generic 422; gh's PR commands use GitHub's supported reopen flow.
     await ghExecFileAsync(
-      [
-        'api',
-        '-X',
-        'PATCH',
-        `repos/${ownerRepo.owner}/${ownerRepo.repo}/pulls/${prNumber}`,
-        '--raw-field',
-        `state=${updates.state}`
-      ],
-      ghOptions
+      ['pr', cmd, String(prNumber), '--repo', `${ownerRepo.owner}/${ownerRepo.repo}`],
+      {
+        ...ghOptions
+      }
     )
     return { ok: true }
   } catch (err) {
@@ -2494,13 +3518,45 @@ export async function requestPRReviewers(
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const logins = reviewers.map((reviewer) => reviewer.trim()).filter(Boolean)
   if (logins.length === 0) {
-    return { ok: false, error: 'Enter at least one reviewer login' }
+    return { ok: false, error: 'Enter at least one reviewer' }
   }
   const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
   const ownerRepo = await getOwnerRepo(repoPath, connectionId)
   await acquire()
   try {
     const args = ['pr', 'edit', String(prNumber), '--add-reviewer', logins.join(',')]
+    if (ownerRepo) {
+      args.push('--repo', `${ownerRepo.owner}/${ownerRepo.repo}`)
+    }
+    await ghExecFileAsync(args, {
+      ...ghOptions,
+      env: { ...process.env, GH_PROMPT_DISABLED: '1' }
+    })
+    return { ok: true }
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : typeof err === 'string' ? err : 'Unknown error'
+    return { ok: false, error: message }
+  } finally {
+    release()
+  }
+}
+
+export async function removePRReviewers(
+  repoPath: string,
+  prNumber: number,
+  reviewers: string[],
+  connectionId?: string | null
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const logins = reviewers.map((reviewer) => reviewer.trim()).filter(Boolean)
+  if (logins.length === 0) {
+    return { ok: false, error: 'Enter at least one reviewer' }
+  }
+  const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
+  const ownerRepo = await getOwnerRepo(repoPath, connectionId)
+  await acquire()
+  try {
+    const args = ['pr', 'edit', String(prNumber), '--remove-reviewer', logins.join(',')]
     if (ownerRepo) {
       args.push('--repo', `${ownerRepo.owner}/${ownerRepo.repo}`)
     }
@@ -2543,6 +3599,56 @@ export async function updatePRTitle(
   } catch (err) {
     console.warn('updatePRTitle failed:', err)
     return false
+  } finally {
+    release()
+  }
+}
+
+export async function updatePRDetails(
+  repoPath: string,
+  prNumber: number,
+  updates: { title?: string; body?: string },
+  connectionId?: string | null,
+  prRepo?: OwnerRepo | null
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ghOptions = ghRepoExecOptions(githubRepoContext(repoPath, connectionId))
+  const ownerRepo = prRepo ?? (await getOwnerRepo(repoPath, connectionId))
+  if (!ownerRepo) {
+    return { ok: false, error: 'Could not resolve GitHub owner/repo for this repository' }
+  }
+
+  const fields: string[] = []
+  if (updates.title !== undefined) {
+    const title = updates.title.trim()
+    if (!title) {
+      return { ok: false, error: 'Title is required' }
+    }
+    fields.push(`title=${title}`)
+  }
+  if (updates.body !== undefined) {
+    fields.push(`body=${updates.body}`)
+  }
+  if (fields.length === 0) {
+    return { ok: true }
+  }
+
+  await acquire()
+  try {
+    await ghExecFileAsync(
+      [
+        'api',
+        '-X',
+        'PATCH',
+        `repos/${ownerRepo.owner}/${ownerRepo.repo}/pulls/${prNumber}`,
+        ...fields.flatMap((field) => ['--raw-field', field])
+      ],
+      ghOptions
+    )
+    return { ok: true }
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : typeof err === 'string' ? err : 'Unknown error'
+    return { ok: false, error: classifyGhError(message).message }
   } finally {
     release()
   }

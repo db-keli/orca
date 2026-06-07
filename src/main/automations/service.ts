@@ -4,12 +4,15 @@ import type {
   Automation,
   AutomationDispatchRequest,
   AutomationDispatchResult,
+  AutomationPrecheckResult,
   AutomationRun,
   AutomationRunStatus,
   AutomationRunUsage
 } from '../../shared/automations-types'
 import type { ClaudeUsageStore } from '../claude-usage/store'
 import type { CodexUsageStore } from '../codex-usage/store'
+import { splitWorktreeIdForFilesystem } from '../../shared/worktree-id'
+import { runAutomationPrecheck } from './precheck-runner'
 
 const DEFAULT_TICK_MS = 60 * 1000
 
@@ -69,8 +72,44 @@ export class AutomationService {
       throw new Error('Automation not found.')
     }
     const run = this.store.createAutomationRun(automation, Date.now(), 'manual')
-    await this.requestDispatch(automation, run)
-    return run
+    return await this.requestDispatch(automation, run)
+  }
+
+  async runPrecheck(automationId: string, runId: string): Promise<AutomationPrecheckResult | null> {
+    const automation = this.store.listAutomations().find((entry) => entry.id === automationId)
+    if (!automation) {
+      throw new Error('Automation not found.')
+    }
+    const run = this.store.listAutomationRuns(automationId).find((entry) => entry.id === runId)
+    if (!run) {
+      throw new Error('Automation run not found.')
+    }
+    if (run.trigger !== 'scheduled' || !automation.precheck) {
+      return null
+    }
+    const cwd = this.getPrecheckCwd(automation)
+    if (!cwd) {
+      return {
+        command: automation.precheck.command,
+        exitCode: null,
+        timedOut: false,
+        durationMs: 0,
+        stdout: '',
+        stderr: '',
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        error: 'Automation precheck target is no longer available.',
+        startedAt: Date.now(),
+        completedAt: Date.now()
+      }
+    }
+    return await runAutomationPrecheck({
+      precheck: automation.precheck,
+      target:
+        automation.executionTargetType === 'ssh'
+          ? { type: 'ssh', cwd, connectionId: automation.executionTargetId }
+          : { type: 'local', cwd }
+    })
   }
 
   async markDispatchResult(result: AutomationDispatchResult): Promise<AutomationRun> {
@@ -191,6 +230,16 @@ export class AutomationService {
     }
   }
 
+  private getPrecheckCwd(automation: Automation): string | null {
+    if (automation.workspaceMode === 'existing') {
+      const parsed = automation.workspaceId
+        ? splitWorktreeIdForFilesystem(automation.workspaceId)
+        : null
+      return parsed?.worktreePath ?? null
+    }
+    return this.store.getRepo(automation.projectId)?.path ?? null
+  }
+
   private async evaluateAutomation(automation: Automation, now: number): Promise<void> {
     const scheduledFor = this.store.getLatestAutomationOccurrence(automation, now)
     if (scheduledFor === null) {
@@ -214,25 +263,28 @@ export class AutomationService {
     this.store.advanceAutomationNextRun(automation.id, now)
   }
 
-  private async requestDispatch(automation: Automation, run: AutomationRun): Promise<void> {
+  private async requestDispatch(
+    automation: Automation,
+    run: AutomationRun
+  ): Promise<AutomationRun> {
     const webContents = this.webContents
     if (!webContents || webContents.isDestroyed() || !this.rendererReady) {
-      this.store.updateAutomationRun({
+      return this.store.updateAutomationRun({
         runId: run.id,
         status: 'skipped_unavailable',
         workspaceId: automation.workspaceId,
         error: 'No Orca window was available to launch the automation.'
       })
-      return
     }
-    this.store.updateAutomationRun({
+    const updated = this.store.updateAutomationRun({
       runId: run.id,
       status: 'dispatching',
       workspaceId: automation.workspaceId,
       error: null
     })
-    const payload: AutomationDispatchRequest = { automation, run }
+    const payload: AutomationDispatchRequest = { automation, run: updated }
     webContents.send('automations:dispatchRequested', payload)
+    return updated
   }
 }
 
@@ -240,6 +292,7 @@ function isFinalRunStatus(status: AutomationRunStatus): boolean {
   return (
     status === 'completed' ||
     status === 'dispatch_failed' ||
+    status === 'skipped_precheck' ||
     status === 'skipped_missed' ||
     status === 'skipped_unavailable' ||
     status === 'skipped_needs_interactive_auth'

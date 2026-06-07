@@ -78,6 +78,8 @@ export function getAutomationRunStatusLabel(status: AutomationRun['status']): st
       return 'Launched'
     case 'completed':
       return 'Done'
+    case 'skipped_precheck':
+      return 'Precheck skipped'
     case 'skipped_missed':
       return 'Skipped'
     case 'skipped_unavailable':
@@ -99,7 +101,7 @@ export function Field({
   className?: string
 }): React.JSX.Element {
   return (
-    <div className={cn('space-y-1.5', className)}>
+    <div className={cn('min-w-0 space-y-1.5', className)}>
       <div className="text-xs text-muted-foreground">{label}</div>
       {children}
     </div>

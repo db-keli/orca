@@ -3,13 +3,25 @@ import type React from 'react'
 import type { WorkspaceStatus, Worktree } from '../../../../shared/types'
 import {
   CARD_SELECTOR,
+  getCardDropTarget,
+  removeCardDropIndicator,
+  resolveWorkspaceKanbanCardDropCommitTarget,
+  updateCardDropIndicator,
+  type WorkspaceKanbanCardTrackedDropTarget
+} from './workspace-kanban-card-pointer-drag-dom'
+import {
   createDragPreview,
   getDraggedCards,
-  getDropTarget,
   setDragDocumentStyles,
   setDraggedCardsDragging,
   updateDragPreviewPosition
-} from './workspace-kanban-card-pointer-drag-dom'
+} from './workspace-kanban-card-drag-preview-dom'
+import {
+  shouldIgnoreWorkspaceKanbanCardPointerDown,
+  shouldStartWorkspaceKanbanCardPointerDrag
+} from './workspace-kanban-card-pointer-drag-start'
+
+export { shouldStartWorkspaceKanbanCardPointerDrag } from './workspace-kanban-card-pointer-drag-start'
 
 const POINTER_DRAG_THRESHOLD = 5
 
@@ -26,6 +38,8 @@ type DragState = {
   previewOffsetX: number
   previewOffsetY: number
   started: boolean
+  frameId: number | null
+  latestDropTarget: WorkspaceKanbanCardTrackedDropTarget | null
 }
 
 type UseWorkspaceKanbanCardPointerDragParams = {
@@ -33,29 +47,15 @@ type UseWorkspaceKanbanCardPointerDragParams = {
   boardRef: React.RefObject<HTMLElement | null>
   selectedWorktreeIds: ReadonlySet<string>
   selectedWorktrees: readonly Worktree[]
-  onMoveWorktreesToStatus: (worktreeIds: readonly string[], status: WorkspaceStatus) => void
+  onDropWorktreesInStatus: (args: {
+    worktreeIds: readonly string[]
+    status: WorkspaceStatus
+    dropIndex: number
+  }) => void
+  onShouldShowDropIndicator: (worktreeIds: readonly string[], status: WorkspaceStatus) => boolean
   onPinWorktrees: (worktreeIds: readonly string[]) => void
   onDragTargetChange: (status: WorkspaceStatus | null) => void
   onPinDragTargetChange: (isOver: boolean) => void
-}
-
-function shouldIgnorePointerDown(target: EventTarget | null, card: HTMLElement): boolean {
-  if (!(target instanceof Element)) {
-    return false
-  }
-  const interactive = target.closest(
-    [
-      'a',
-      'input',
-      'button',
-      'select',
-      'textarea',
-      '[contenteditable="true"]',
-      '[data-workspace-board-column-resize-handle]',
-      '[role="menuitem"]'
-    ].join(',')
-  )
-  return interactive !== null && interactive !== card
 }
 
 export function useWorkspaceKanbanCardPointerDrag({
@@ -63,7 +63,8 @@ export function useWorkspaceKanbanCardPointerDrag({
   boardRef,
   selectedWorktreeIds,
   selectedWorktrees,
-  onMoveWorktreesToStatus,
+  onDropWorktreesInStatus,
+  onShouldShowDropIndicator,
   onPinWorktrees,
   onDragTargetChange,
   onPinDragTargetChange
@@ -76,19 +77,21 @@ export function useWorkspaceKanbanCardPointerDrag({
   const suppressClickUntilRef = useRef(0)
   const selectedWorktreeIdsRef = useRef(selectedWorktreeIds)
   const selectedWorktreesRef = useRef(selectedWorktrees)
-  const moveWorktreesRef = useRef(onMoveWorktreesToStatus)
+  const dropWorktreesInStatusRef = useRef(onDropWorktreesInStatus)
+  const shouldShowDropIndicatorRef = useRef(onShouldShowDropIndicator)
   const pinWorktreesRef = useRef(onPinWorktrees)
   const dragTargetChangeRef = useRef(onDragTargetChange)
   const pinDragTargetChangeRef = useRef(onPinDragTargetChange)
 
-  useEffect(() => {
-    selectedWorktreeIdsRef.current = selectedWorktreeIds
-    selectedWorktreesRef.current = selectedWorktrees
-    moveWorktreesRef.current = onMoveWorktreesToStatus
-    pinWorktreesRef.current = onPinWorktrees
-    dragTargetChangeRef.current = onDragTargetChange
-    pinDragTargetChangeRef.current = onPinDragTargetChange
-  })
+  // Why: document-level pointer handlers stay stable during drags, but their
+  // selection/drop refs must reflect the latest board state before events run.
+  selectedWorktreeIdsRef.current = selectedWorktreeIds
+  selectedWorktreesRef.current = selectedWorktrees
+  dropWorktreesInStatusRef.current = onDropWorktreesInStatus
+  shouldShowDropIndicatorRef.current = onShouldShowDropIndicator
+  pinWorktreesRef.current = onPinWorktrees
+  dragTargetChangeRef.current = onDragTargetChange
+  pinDragTargetChangeRef.current = onPinDragTargetChange
 
   const clearDragTarget = useCallback(() => {
     dragTargetChangeRef.current(null)
@@ -101,8 +104,21 @@ export function useWorkspaceKanbanCardPointerDrag({
       if (!state) {
         return
       }
+      const commitTarget =
+        commit && state.started && boardRef.current
+          ? resolveWorkspaceKanbanCardDropCommitTarget({
+              currentTarget: getCardDropTarget(boardRef.current, state.currentX, state.currentY),
+              latestTrackedTarget: state.latestDropTarget,
+              x: state.currentX,
+              y: state.currentY
+            })
+          : null
       dragRef.current = null
+      if (state.frameId !== null) {
+        window.cancelAnimationFrame(state.frameId)
+      }
       setDraggedCardsDragging(state.draggedCards, false)
+      removeCardDropIndicator()
       state.preview?.remove()
       setDragDocumentStyles(false)
       clearDragTarget()
@@ -113,19 +129,18 @@ export function useWorkspaceKanbanCardPointerDrag({
 
       isPointerDragActiveRef.current = false
       suppressClickUntilRef.current = performance.now() + 250
-      if (!commit) {
+      if (!commit || !commitTarget) {
         return
       }
 
-      const board = boardRef.current
-      if (!board) {
-        return
-      }
-      const dropTarget = getDropTarget(board, state.currentX, state.currentY)
-      if (dropTarget.isPinDrop) {
+      if (commitTarget.isPinDrop) {
         pinWorktreesRef.current(state.worktreeIds)
-      } else if (dropTarget.status) {
-        moveWorktreesRef.current(state.worktreeIds, dropTarget.status)
+      } else if (commitTarget.status) {
+        dropWorktreesInStatusRef.current({
+          worktreeIds: state.worktreeIds,
+          status: commitTarget.status,
+          dropIndex: commitTarget.dropIndex
+        })
       }
     },
     [boardRef, clearDragTarget]
@@ -144,13 +159,50 @@ export function useWorkspaceKanbanCardPointerDrag({
       const board = boardRef.current
       if (!board) {
         clearDragTarget()
+        removeCardDropIndicator()
         return
       }
-      const dropTarget = getDropTarget(board, state.currentX, state.currentY)
+      const dropTarget = getCardDropTarget(board, state.currentX, state.currentY)
+      state.latestDropTarget = {
+        target: dropTarget,
+        x: state.currentX,
+        y: state.currentY
+      }
       pinDragTargetChangeRef.current(dropTarget.isPinDrop)
       dragTargetChangeRef.current(dropTarget.status)
+      if (
+        dropTarget.status &&
+        shouldShowDropIndicatorRef.current(state.worktreeIds, dropTarget.status)
+      ) {
+        updateCardDropIndicator(board, dropTarget)
+      } else {
+        removeCardDropIndicator()
+      }
     },
     [boardRef, clearDragTarget]
+  )
+
+  const flushPointerDragFrame = useCallback(() => {
+    const state = dragRef.current
+    if (!state) {
+      return
+    }
+    state.frameId = null
+    if (!state.started) {
+      return
+    }
+    updateDragPreviewPosition(state)
+    updatePointerDragTarget(state)
+  }, [updatePointerDragTarget])
+
+  const schedulePointerDragFrame = useCallback(
+    (state: DragState) => {
+      if (state.frameId !== null) {
+        return
+      }
+      state.frameId = window.requestAnimationFrame(flushPointerDragFrame)
+    },
+    [flushPointerDragFrame]
   )
 
   useEffect(() => {
@@ -174,8 +226,7 @@ export function useWorkspaceKanbanCardPointerDrag({
         return
       }
       event.preventDefault()
-      updateDragPreviewPosition(state)
-      updatePointerDragTarget(state)
+      schedulePointerDragFrame(state)
     }
 
     const handlePointerUp = (event: PointerEvent): void => {
@@ -185,7 +236,9 @@ export function useWorkspaceKanbanCardPointerDrag({
       }
       state.currentX = event.clientX
       state.currentY = event.clientY
-      event.preventDefault()
+      if (state.started) {
+        event.preventDefault()
+      }
       stopPointerDrag(true)
     }
 
@@ -213,11 +266,11 @@ export function useWorkspaceKanbanCardPointerDrag({
       window.removeEventListener('blur', handleBlur)
       stopPointerDrag(false)
     }
-  }, [open, startPointerDrag, stopPointerDrag, updatePointerDragTarget])
+  }, [open, schedulePointerDragFrame, startPointerDrag, stopPointerDrag])
 
   const onCardPointerDownCapture = useCallback(
     (event: React.PointerEvent<HTMLElement>) => {
-      if (!open || event.button !== 0 || event.pointerType === 'touch') {
+      if (!open || !shouldStartWorkspaceKanbanCardPointerDrag(event.nativeEvent)) {
         return
       }
       const target = event.target
@@ -227,7 +280,12 @@ export function useWorkspaceKanbanCardPointerDrag({
       const card = target.closest<HTMLElement>(CARD_SELECTOR)
       const worktreeId = card?.dataset.workspaceBoardCardId
       const board = boardRef.current
-      if (!card || !worktreeId || !board?.contains(card) || shouldIgnorePointerDown(target, card)) {
+      if (
+        !card ||
+        !worktreeId ||
+        !board?.contains(card) ||
+        shouldIgnoreWorkspaceKanbanCardPointerDown(target, card)
+      ) {
         return
       }
 
@@ -249,7 +307,9 @@ export function useWorkspaceKanbanCardPointerDrag({
         preview: null,
         previewOffsetX: 0,
         previewOffsetY: 0,
-        started: false
+        started: false,
+        frameId: null,
+        latestDropTarget: null
       }
     },
     [boardRef, open]

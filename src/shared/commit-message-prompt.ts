@@ -2,7 +2,7 @@
 // renderer (preview/tests) and main (actual generation) reach the exact same
 // string without duplicating the wording.
 
-export const COMMIT_MESSAGE_BASE_PROMPT = `You are generating a single git commit message.
+const COMMIT_MESSAGE_BASE_PROMPT = `You are generating a single git commit message.
 Read the staged diff below and produce the message.
 
 Rules:
@@ -25,7 +25,7 @@ export function buildCommitPrompt(diff: string, customSuffix: string): string {
   if (!trimmedSuffix) {
     return base
   }
-  return `${base}\n\nAdditional instructions from user:\n${trimmedSuffix}`
+  return `${base}\n\nAdditional user prompt:\n${trimmedSuffix}`
 }
 
 export const STAGED_DIFF_BYTE_BUDGET = 200_000
@@ -50,8 +50,8 @@ export function cleanGeneratedCommitMessage(raw: string): string {
   // Why: some CLIs (opencode) emit ANSI control sequences to stdout even when
   // writing to a pipe. Strip them before any other processing so they don't
   // end up in the saved commit message.
-  // eslint-disable-next-line no-control-regex
   let text = raw
+    // eslint-disable-next-line no-control-regex
     .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
     .replace(/\r\n/g, '\n')
     .trim()
@@ -79,7 +79,15 @@ export function cleanGeneratedCommitMessage(raw: string): string {
     text = fenced[1].trim()
   }
 
+  // Why: some CLIs format a one-shot answer as a list item even when the
+  // prompt asks for raw text; a Git subject should not carry that marker.
+  text = text.replace(/^(\s*)(?:[-*•●]\s+|\d+[.)]\s+)/, '$1').trim()
+
   return text
+}
+
+function stripAnsiControlSequences(value: string): string {
+  return value.replace(new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, 'g'), '')
 }
 
 export const CUSTOM_PROMPT_PLACEHOLDER = '{prompt}'
@@ -208,7 +216,7 @@ export function planCustomCommand(template: string, prompt: string): CustomComma
 // out the real message so the user sees something legible instead of a
 // dump of the agent's runtime state.
 export function extractAgentErrorMessage(stdout: string, stderr: string): string | null {
-  const combined = `${stdout}\n${stderr}`
+  const combined = stripAnsiControlSequences(`${stdout}\n${stderr}`)
   const lines = combined.split(/\r?\n/)
 
   // Pass 1: look for an `ERROR:`/`Error:` line carrying a JSON payload.
@@ -216,7 +224,7 @@ export function extractAgentErrorMessage(stdout: string, stderr: string): string
   // error wins when an agent prints multiple.
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i]
-    const match = /^\s*(?:ERROR|Error)\s*:\s*(.+)$/.exec(line)
+    const match = /^\s*(?:ERROR|Error(?:\s+during\s+[^:]+)?)\s*:\s*(.+)$/i.exec(line)
     if (!match) {
       continue
     }
@@ -234,6 +242,19 @@ export function extractAgentErrorMessage(stdout: string, stderr: string): string
       } catch {
         // Fall through to using the raw payload below.
       }
+    }
+    if (payload.length > 0) {
+      return payload
+    }
+  }
+
+  const compact = combined.replace(/([A-Za-z])\r?\n\s*([A-Za-z_])/g, '$1$2').replace(/\s+/g, ' ')
+  const errorCodeMatch = /\bError code:\s*\d+\s*-\s*(.+)$/i.exec(compact)
+  if (errorCodeMatch) {
+    const payload = errorCodeMatch[1].trim()
+    const messageMatch = /['"]message['"]\s*:\s*['"]([^'"]+)['"]/i.exec(payload)
+    if (messageMatch?.[1]?.trim()) {
+      return messageMatch[1].trim()
     }
     if (payload.length > 0) {
       return payload

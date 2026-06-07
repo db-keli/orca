@@ -2,14 +2,20 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'fs'
 import { dirname, join } from 'path'
 import { exec, execFile } from 'child_process'
+import { parse } from 'yaml'
 import { getDefaultRepoHookSettings } from '../shared/constants'
+import { getRuntimePathBasename } from '../shared/cross-platform-path'
+import { resolveHookCommandSourcePolicy } from '../shared/hook-command-source-policy'
 import { gitExecFileSync } from './git/runner'
 import { isWslPath, parseWslPath, toWindowsWslPath, toLinuxPath } from './wsl'
 import type {
+  HookCommandSourcePolicy,
+  OrcaDefaultTabTemplate,
   OrcaHooks,
   Repo,
   SetupDecision,
   SetupRunPolicy,
+  WorktreeDefaultTabsLaunch,
   WorktreeSetupLaunch
 } from '../shared/types'
 
@@ -23,88 +29,79 @@ function getHookShell(): string | undefined {
   return '/bin/bash'
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function asTrimmedString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined
+}
+
+const DEFAULT_TAB_COLOR_RE = /^#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?$/
+
+function normalizeDefaultTabs(value: unknown): OrcaDefaultTabTemplate[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return value
+    .map((entry) => {
+      const record = asRecord(entry)
+      if (!record) {
+        return null
+      }
+      const title = asTrimmedString(record.title)
+      const command = asTrimmedString(record.command)
+      const color = asTrimmedString(record.color)
+      const normalizedColor = color && DEFAULT_TAB_COLOR_RE.test(color) ? color : undefined
+      if (!title && !command && !normalizedColor) {
+        return null
+      }
+      return {
+        ...(title ? { title } : {}),
+        ...(normalizedColor ? { color: normalizedColor } : {}),
+        ...(command ? { command } : {})
+      }
+    })
+    .filter((entry): entry is OrcaDefaultTabTemplate => entry !== null)
+}
+
 /**
- * Parse a simple orca.yaml file. Handles only the supported `scripts:` and
- * `issueCommand:` keys with multiline string values (YAML block scalar `|`).
+ * Parse the supported project defaults from `orca.yaml`.
  */
 export function parseOrcaYaml(content: string): OrcaHooks | null {
-  const hooks: OrcaHooks = { scripts: {} }
-  const lines = content.split(/\r?\n/)
-
-  let currentSection: 'scripts' | 'issueCommand' | null = null
-  let currentKey: 'setup' | 'archive' | null = null
-  let issueCommandValue = ''
-
-  for (const line of lines) {
-    const topLevelKeyMatch = line.match(/^([A-Za-z][A-Za-z0-9_-]*):\s*(\|)?\s*(.*)$/)
-    if (topLevelKeyMatch) {
-      if (currentSection === 'scripts' && currentKey) {
-        hooks.scripts[currentKey] = issueCommandValue.trimEnd()
-      } else if (currentSection === 'issueCommand') {
-        hooks.issueCommand = issueCommandValue.trimEnd() || undefined
-      }
-
-      const [, key, blockScalar, rest] = topLevelKeyMatch
-      currentKey = null
-      issueCommandValue = ''
-
-      if (key === 'scripts') {
-        currentSection = 'scripts'
-        continue
-      }
-
-      if (key === 'issueCommand') {
-        currentSection = 'issueCommand'
-        if (blockScalar) {
-          continue
-        }
-        hooks.issueCommand = rest.trim() || undefined
-        currentSection = null
-        continue
-      }
-
-      currentSection = null
-      continue
-    }
-
-    if (currentSection === 'scripts') {
-      // Indented key like "  setup: |" or "  archive: |" or "  setup: echo hello"
-      const keyMatch = line.match(/^  (setup|archive):\s*(\|)?\s*(.*)$/)
-      if (keyMatch) {
-        // Save previous key
-        if (currentKey) {
-          hooks.scripts[currentKey] = issueCommandValue.trimEnd()
-        }
-        currentKey = keyMatch[1] as 'setup' | 'archive'
-        issueCommandValue = keyMatch[3] ? `${keyMatch[3]}\n` : ''
-        continue
-      }
-
-      // Content line (indented by 4+ spaces under a key)
-      if (currentKey && line.startsWith('    ')) {
-        issueCommandValue += `${line.slice(4)}\n`
-      }
-      continue
-    }
-
-    if (currentSection === 'issueCommand' && line.startsWith('  ')) {
-      // Why: `issueCommand` is a top-level scalar in `orca.yaml`, so its block
-      // content must stay separate from the `scripts:` parser rather than being
-      // shoehorned into that section's indentation rules.
-      issueCommandValue += `${line.slice(2)}\n`
-    }
-  }
-
-  if (currentSection === 'scripts' && currentKey) {
-    hooks.scripts[currentKey] = issueCommandValue.trimEnd()
-  } else if (currentSection === 'issueCommand') {
-    hooks.issueCommand = issueCommandValue.trimEnd() || undefined
-  }
-
-  if (!hooks.scripts.setup && !hooks.scripts.archive && !hooks.issueCommand) {
+  let root: unknown
+  try {
+    root = parse(content)
+  } catch {
     return null
   }
-  return hooks
+
+  const record = asRecord(root)
+  if (!record) {
+    return null
+  }
+
+  const scriptsRecord = asRecord(record.scripts)
+  const setup = scriptsRecord ? asTrimmedString(scriptsRecord.setup) : undefined
+  const archive = scriptsRecord ? asTrimmedString(scriptsRecord.archive) : undefined
+  const issueCommand = asTrimmedString(record.issueCommand)
+  const defaultTabs = normalizeDefaultTabs(record.defaultTabs)
+
+  if (!setup && !archive && !issueCommand && defaultTabs.length === 0) {
+    return null
+  }
+
+  return {
+    scripts: {
+      ...(setup ? { setup } : {}),
+      ...(archive ? { archive } : {})
+    },
+    ...(issueCommand ? { issueCommand } : {}),
+    ...(defaultTabs.length > 0 ? { defaultTabs } : {})
+  }
 }
 
 /**
@@ -136,7 +133,7 @@ export function hasHooksFile(repoPath: string): boolean {
 // return `null` from `parseOrcaYaml` and show a confusing "could not be parsed"
 // error.  Detecting well-formed but unrecognised keys lets the UI suggest an
 // update instead of implying the file is broken.
-const RECOGNIZED_ORCA_YAML_KEYS = new Set(['scripts', 'issueCommand'])
+const RECOGNIZED_ORCA_YAML_KEYS = new Set(['scripts', 'issueCommand', 'defaultTabs'])
 
 /**
  * Return true when `orca.yaml` contains at least one top-level key that this
@@ -261,27 +258,59 @@ function ensureOrcaDirIgnored(repoPath: string): void {
   }
 }
 
-export function getEffectiveHooks(repo: Repo, worktreePath?: string): OrcaHooks | null {
-  const yamlHooks = loadHooks(worktreePath ?? repo.path)
-  const legacySetup = repo.hookSettings?.scripts.setup?.trim()
-  const legacyArchive = repo.hookSettings?.scripts.archive?.trim()
-  const setup = yamlHooks?.scripts.setup?.trim() || legacySetup
-  const archive = yamlHooks?.scripts.archive?.trim() || legacyArchive
+function getEffectiveHookScript(
+  yamlScript: string | undefined,
+  localScript: string | undefined,
+  policy: HookCommandSourcePolicy
+): string | undefined {
+  const shared = yamlScript?.trim()
+  const local = localScript?.trim()
+
+  if (policy === 'local-only') {
+    return local || undefined
+  }
+
+  if (policy === 'run-both') {
+    return [shared, local].filter(Boolean).join('\n') || undefined
+  }
+
+  return shared || undefined
+}
+
+export function getEffectiveHooksFromConfig(
+  repo: Repo,
+  yamlHooks: OrcaHooks | null
+): OrcaHooks | null {
+  const localSetup = repo.hookSettings?.scripts.setup
+  const localArchive = repo.hookSettings?.scripts.archive
+  const rawPolicy = repo.hookSettings?.commandSourcePolicy
+  const setupPolicy = resolveHookCommandSourcePolicy(rawPolicy, {
+    hasLocalScript: Boolean(localSetup?.trim())
+  })
+  const archivePolicy = resolveHookCommandSourcePolicy(rawPolicy, {
+    hasLocalScript: Boolean(localArchive?.trim())
+  })
+  const setup = getEffectiveHookScript(yamlHooks?.scripts.setup, localSetup, setupPolicy)
+  const archive = getEffectiveHookScript(yamlHooks?.scripts.archive, localArchive, archivePolicy)
 
   if (!setup && !archive) {
     return null
   }
 
-  // Why: `orca.yaml` is the preferred source going forward, but existing users may
-  // still have setup/archive commands persisted only in repo settings. Resolve each
-  // hook independently so a repo that has only migrated one command into `orca.yaml`
-  // does not silently lose the other legacy hook until the migration is complete.
+  // Why: committed `orca.yaml` and local Settings commands can intentionally
+  // coexist, but the source policy defines whether the committed file is an
+  // authoritative boundary, local settings are authoritative, or both run.
   return {
     scripts: {
       ...(setup ? { setup } : {}),
       ...(archive ? { archive } : {})
     }
   }
+}
+
+export function getEffectiveHooks(repo: Repo, worktreePath?: string): OrcaHooks | null {
+  const hooksRoot = worktreePath ?? repo.path
+  return getEffectiveHooksFromConfig(repo, loadHooks(hooksRoot))
 }
 
 export function getEffectiveSetupRunPolicy(repo: Repo): SetupRunPolicy {
@@ -304,11 +333,64 @@ export function shouldRunSetupForCreate(repo: Repo, decision: SetupDecision = 'i
   return policy === 'run-by-default'
 }
 
+export function getDefaultTabCommandTrustContent(hooks: OrcaHooks | null): string {
+  const commands = (hooks?.defaultTabs ?? [])
+    .map((tab, index) => {
+      const command = tab.command?.trim()
+      if (!command) {
+        return null
+      }
+      const label = tab.title ? ` ${tab.title}` : ''
+      return `# defaultTabs[${index + 1}]${label}\n${command}`
+    })
+    .filter((entry): entry is string => entry !== null)
+  return [hooks?.scripts.setup?.trim(), ...commands].filter(Boolean).join('\n\n')
+}
+
+export function getDefaultTabsLaunch(
+  hooks: OrcaHooks | null,
+  repo: Repo,
+  decision: SetupDecision = 'inherit'
+): WorktreeDefaultTabsLaunch | undefined {
+  const tabs = hooks?.defaultTabs ?? []
+  if (tabs.length === 0) {
+    return undefined
+  }
+  const hasCommands = tabs.some((tab) => Boolean(tab.command?.trim()))
+  const sharedCommandPolicy = resolveHookCommandSourcePolicy(
+    repo.hookSettings?.commandSourcePolicy,
+    {
+      hasLocalScript: Boolean(repo.hookSettings?.scripts.setup?.trim())
+    }
+  )
+  // Why: default tab commands come from committed `orca.yaml`; a repo set to
+  // local-only may still use shared titles/colors, but must not execute them.
+  const canRunSharedCommands = sharedCommandPolicy !== 'local-only'
+  const runCommands =
+    hasCommands && canRunSharedCommands ? shouldRunSetupForCreate(repo, decision) : false
+  return { tabs, runCommands }
+}
+
 export function getSetupCommandSource(
   repo: Repo,
   worktreePath?: string
-): { source: 'yaml'; command: string } | null {
-  const yamlSetup = loadHooks(worktreePath ?? repo.path)?.scripts.setup?.trim()
+): { source: 'yaml' | 'local' | 'both'; command: string } | null {
+  const hooksRoot = worktreePath ?? repo.path
+  const yamlHooks = loadHooks(hooksRoot)
+  const yamlSetup = yamlHooks?.scripts.setup?.trim()
+  const localSetup = repo.hookSettings?.scripts.setup?.trim()
+  const rawPolicy = repo.hookSettings?.commandSourcePolicy
+  const policy = resolveHookCommandSourcePolicy(rawPolicy, {
+    hasLocalScript: Boolean(localSetup)
+  })
+
+  if (policy === 'local-only') {
+    return localSetup ? { source: 'local', command: localSetup } : null
+  }
+
+  if (policy === 'run-both' && yamlSetup && localSetup) {
+    return { source: 'both', command: `${yamlSetup}\n${localSetup}` }
+  }
 
   if (yamlSetup) {
     return { source: 'yaml', command: yamlSetup }
@@ -321,6 +403,7 @@ function getSetupEnvVars(repo: Repo, worktreePath: string): Record<string, strin
   return {
     ORCA_ROOT_PATH: repo.path,
     ORCA_WORKTREE_PATH: worktreePath,
+    ORCA_WORKSPACE_NAME: getRuntimePathBasename(worktreePath),
     // Compat with conductor.json users
     CONDUCTOR_ROOT_PATH: repo.path,
     GHOSTX_ROOT_PATH: repo.path
@@ -333,7 +416,7 @@ function getGitPath(cwd: string, relativePath: string): string {
   }).trim()
 }
 
-function buildWindowsRunnerScript(script: string): string {
+export function buildWindowsRunnerScript(script: string): string {
   const lines = script.replace(/\r?\n/g, '\n').split('\n')
   const runnerLines = ['@echo off', 'setlocal EnableExtensions']
 
@@ -362,6 +445,14 @@ export function createSetupRunnerScript(
   script: string
 ): WorktreeSetupLaunch {
   return createWorktreeRunnerScript(repo, worktreePath, script, 'setup-runner')
+}
+
+export function getSetupRunnerEnvVars(repo: Repo, worktreePath: string): Record<string, string> {
+  return getSetupEnvVars(repo, worktreePath)
+}
+
+export function buildPosixRunnerScript(script: string): string {
+  return `#!/usr/bin/env bash\nset -e\n${script.replace(/\r\n/g, '\n')}\n`
 }
 
 export function createIssueCommandRunnerScript(
@@ -466,30 +557,53 @@ export function runHook(
     }
 
     return new Promise((resolve) => {
-      execFile(
-        'wsl.exe',
-        ['-d', wslInfo.distro, '--', 'bash', '-c', bashCmd],
-        {
-          timeout: HOOK_TIMEOUT,
-          encoding: 'utf-8',
-          env: { ...process.env, ...wslEnv }
-        },
-        (error, stdout, stderr) => {
-          if (error) {
-            console.error(`[hooks] ${hookName} hook failed in ${cwd}:`, error.message)
-            resolve({
-              success: false,
-              output: `${stdout}\n${stderr}\n${error.message}`.trim()
-            })
-          } else {
-            console.log(`[hooks] ${hookName} hook completed in ${cwd}`)
-            resolve({
-              success: true,
-              output: `${stdout}\n${stderr}`.trim()
-            })
-          }
+      let child: ReturnType<typeof execFile> | null = null
+      let settled = false
+
+      const finish = (error: Error | null, stdout = '', stderr = ''): void => {
+        if (settled) {
+          return
         }
-      )
+        settled = true
+        clearTimeout(timeout)
+        if (error) {
+          console.error(`[hooks] ${hookName} hook failed in ${cwd}:`, error.message)
+          resolve({
+            success: false,
+            output: `${stdout}\n${stderr}\n${error.message}`.trim()
+          })
+        } else {
+          console.log(`[hooks] ${hookName} hook completed in ${cwd}`)
+          resolve({
+            success: true,
+            output: `${stdout}\n${stderr}`.trim()
+          })
+        }
+      }
+
+      // Why: Node's execFile timeout only signals wsl.exe; if no callback
+      // arrives, hook setup/archive must still unblock after HOOK_TIMEOUT.
+      const timeout = setTimeout(() => {
+        child?.kill()
+        finish(new Error(`Hook timed out after ${HOOK_TIMEOUT}ms.`))
+      }, HOOK_TIMEOUT)
+
+      try {
+        child = execFile(
+          'wsl.exe',
+          ['-d', wslInfo.distro, '--', 'bash', '-c', bashCmd],
+          {
+            timeout: HOOK_TIMEOUT,
+            encoding: 'utf-8',
+            env: { ...process.env, ...wslEnv }
+          },
+          (error, stdout, stderr) => {
+            finish(error ?? null, stdout, stderr)
+          }
+        )
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 

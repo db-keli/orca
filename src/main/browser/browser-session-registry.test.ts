@@ -39,8 +39,10 @@ describe('BrowserSessionRegistry', () => {
     sessionFromPartitionMock.mockReturnValue({
       setPermissionRequestHandler: vi.fn(),
       setPermissionCheckHandler: vi.fn(),
+      setDevicePermissionHandler: vi.fn(),
       setDisplayMediaRequestHandler: vi.fn(),
       on: vi.fn(),
+      removeListener: vi.fn(),
       clearStorageData: vi.fn().mockResolvedValue(undefined),
       clearCache: vi.fn().mockResolvedValue(undefined)
     })
@@ -143,6 +145,23 @@ describe('BrowserSessionRegistry', () => {
     expect(browserSessionRegistry.getProfile(profile!.id)).toBeNull()
   })
 
+  it('clears session policy callbacks when deleting a profile', async () => {
+    const profile = browserSessionRegistry.createProfile('isolated', 'Policy Delete Test')
+    expect(profile).not.toBeNull()
+    const mockSession = sessionFromPartitionMock.mock.results[0]?.value
+    const downloadHandler = mockSession.on.mock.calls.find(
+      ([eventName]) => eventName === 'will-download'
+    )?.[1]
+
+    await expect(browserSessionRegistry.deleteProfile(profile!.id)).resolves.toBe(true)
+
+    expect(mockSession.removeListener).toHaveBeenCalledWith('will-download', downloadHandler)
+    expect(mockSession.setPermissionRequestHandler).toHaveBeenLastCalledWith(null)
+    expect(mockSession.setPermissionCheckHandler).toHaveBeenLastCalledWith(null)
+    expect(mockSession.setDevicePermissionHandler).toHaveBeenLastCalledWith(null)
+    expect(mockSession.setDisplayMediaRequestHandler).toHaveBeenLastCalledWith(null)
+  })
+
   it('refuses to delete the default profile', async () => {
     const deleted = await browserSessionRegistry.deleteProfile('default')
     expect(deleted).toBe(false)
@@ -168,6 +187,7 @@ describe('BrowserSessionRegistry', () => {
     const mockSession = sessionFromPartitionMock.mock.results[0]?.value
     expect(mockSession?.setPermissionRequestHandler).toHaveBeenCalled()
     expect(mockSession?.setPermissionCheckHandler).toHaveBeenCalled()
+    expect(mockSession?.setDevicePermissionHandler).toHaveBeenCalled()
   })
 
   it('routes media permission requests through macOS TCC for isolated partitions', async () => {
@@ -187,6 +207,64 @@ describe('BrowserSessionRegistry', () => {
 
     expect(checkHandler(null, 'media', '', { mediaType: 'video' })).toBe(true)
     expect(checkHandler(null, 'notifications', '', {})).toBe(false)
+  })
+
+  it('wires WebAuthn device selection for isolated partitions', () => {
+    browserSessionRegistry.createProfile('isolated', 'Security Key Test')
+    const mockSession = sessionFromPartitionMock.mock.results[0]?.value
+    const devicePermissionHandler = mockSession.setDevicePermissionHandler.mock.calls[0][0]
+    const checkHandler = mockSession.setPermissionCheckHandler.mock.calls[0][0]
+
+    expect(
+      devicePermissionHandler({
+        deviceType: 'hid',
+        origin: 'https://github.com',
+        device: { collections: [{ usagePage: 0xf1d0 }] }
+      })
+    ).toBe(true)
+    expect(
+      devicePermissionHandler({
+        deviceType: 'hid',
+        origin: 'http://[::1]:5173',
+        device: { collections: [{ usagePage: 0xf1d0 }] }
+      })
+    ).toBe(true)
+    expect(
+      devicePermissionHandler({
+        deviceType: 'hid',
+        origin: 'https://github.com',
+        device: { collections: [{ usagePage: 1 }] }
+      })
+    ).toBe(false)
+    expect(checkHandler(null, 'hid', '', { securityOrigin: 'https://github.com' })).toBe(true)
+
+    const selectHidHandler = mockSession.on.mock.calls.find(
+      ([eventName]) => eventName === 'select-hid-device'
+    )?.[1]
+    const hidCallback = vi.fn()
+    selectHidHandler(
+      { preventDefault: vi.fn() },
+      {
+        frame: { url: 'https://github.com' },
+        deviceList: [
+          { deviceId: 'keyboard', collections: [{ usagePage: 1 }] },
+          { deviceId: 'security-key', collections: [{ usagePage: 0xf1d0 }] }
+        ]
+      },
+      hidCallback
+    )
+    expect(hidCallback).toHaveBeenCalledWith('security-key')
+
+    const selectWebAuthnHandler = mockSession.on.mock.calls.find(
+      ([eventName]) => eventName === 'select-webauthn-account'
+    )?.[1]
+    const webAuthnCallback = vi.fn()
+    selectWebAuthnHandler(
+      { preventDefault: vi.fn() },
+      { accounts: [{ credentialId: 'credential-1' }] },
+      webAuthnCallback
+    )
+    expect(webAuthnCallback).toHaveBeenCalledWith('credential-1')
   })
 
   describe('setupClientHintsOverride', () => {

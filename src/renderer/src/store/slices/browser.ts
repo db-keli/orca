@@ -13,7 +13,7 @@ import type {
   WorkspaceSessionState
 } from '../../../../shared/types'
 import { GRAB_BUDGET, type BrowserPageAnnotation } from '../../../../shared/browser-grab-types'
-import { ORCA_BROWSER_BLANK_URL } from '../../../../shared/constants'
+import { FLOATING_TERMINAL_WORKTREE_ID, ORCA_BROWSER_BLANK_URL } from '../../../../shared/constants'
 import { redactKagiSessionToken } from '../../../../shared/browser-url'
 import {
   MAX_BROWSER_HISTORY_ENTRIES,
@@ -27,6 +27,7 @@ import {
   getActiveRuntimeTarget,
   type RuntimeClientTarget
 } from '@/runtime/runtime-rpc-client'
+import { toRuntimeWorktreeSelector } from '@/runtime/runtime-worktree-selector'
 import type {
   BrowserDetectProfilesResult,
   BrowserProfileClearDefaultCookiesResult,
@@ -109,6 +110,7 @@ export type BrowserSlice = {
     url: string,
     options?: CreateBrowserTabOptions
   ) => BrowserWorkspace
+  openNewBrowserTabInActiveWorkspace: (groupId: string) => Promise<void>
   closeBrowserTab: (tabId: string) => void
   shutdownWorktreeBrowsers: (worktreeId: string) => Promise<void>
   reopenClosedBrowserTab: (worktreeId: string) => BrowserWorkspace | null
@@ -230,7 +232,7 @@ function closeRemoteBrowserPageInOwningEnvironment(
   void callRuntimeRpc(
     target,
     'browser.tabClose',
-    { worktree: `id:${worktreeId}`, page: handle.remotePageId },
+    { worktree: toRuntimeWorktreeSelector(worktreeId), page: handle.remotePageId },
     { timeoutMs: 15_000 }
   ).catch(() => {})
 }
@@ -317,6 +319,26 @@ function mirrorWorkspaceFromActivePage(
   }
 }
 
+function browserWorkspaceMirrorFieldsEqual(
+  workspace: BrowserWorkspace,
+  mirrored: BrowserWorkspace
+): boolean {
+  const workspacePageIds = workspace.pageIds ?? []
+  const mirroredPageIds = mirrored.pageIds ?? []
+  return (
+    workspace.activePageId === mirrored.activePageId &&
+    workspacePageIds.length === mirroredPageIds.length &&
+    workspacePageIds.every((pageId, index) => pageId === mirroredPageIds[index]) &&
+    workspace.url === mirrored.url &&
+    workspace.title === mirrored.title &&
+    workspace.loading === mirrored.loading &&
+    workspace.faviconUrl === mirrored.faviconUrl &&
+    workspace.canGoBack === mirrored.canGoBack &&
+    workspace.canGoForward === mirrored.canGoForward &&
+    workspace.loadError === mirrored.loadError
+  )
+}
+
 function getFallbackTabTypeForWorktree(
   worktreeId: string,
   openFiles: AppState['openFiles'],
@@ -335,26 +357,46 @@ function getFallbackTabTypeForWorktree(
   return 'terminal'
 }
 
+const browserWorkspaceByIdCache = new WeakMap<
+  Record<string, BrowserWorkspace[]>,
+  Map<string, BrowserWorkspace>
+>()
+const browserPageByIdCache = new WeakMap<Record<string, BrowserPage[]>, Map<string, BrowserPage>>()
+
 function findWorkspace(
   browserTabsByWorktree: Record<string, BrowserWorkspace[]>,
   workspaceId: string
 ): BrowserWorkspace | null {
-  return (
-    Object.values(browserTabsByWorktree)
-      .flat()
-      .find((workspace) => workspace.id === workspaceId) ?? null
-  )
+  const cached = browserWorkspaceByIdCache.get(browserTabsByWorktree)
+  if (cached) {
+    return cached.get(workspaceId) ?? null
+  }
+  const workspaceById = new Map<string, BrowserWorkspace>()
+  for (const workspaces of Object.values(browserTabsByWorktree)) {
+    for (const workspace of workspaces) {
+      workspaceById.set(workspace.id, workspace)
+    }
+  }
+  browserWorkspaceByIdCache.set(browserTabsByWorktree, workspaceById)
+  return workspaceById.get(workspaceId) ?? null
 }
 
 function findPage(
   browserPagesByWorkspace: Record<string, BrowserPage[]>,
   pageId: string
 ): BrowserPage | null {
-  return (
-    Object.values(browserPagesByWorkspace)
-      .flat()
-      .find((page) => page.id === pageId) ?? null
-  )
+  const cached = browserPageByIdCache.get(browserPagesByWorkspace)
+  if (cached) {
+    return cached.get(pageId) ?? null
+  }
+  const pageById = new Map<string, BrowserPage>()
+  for (const pages of Object.values(browserPagesByWorkspace)) {
+    for (const page of pages) {
+      pageById.set(page.id, page)
+    }
+  }
+  browserPageByIdCache.set(browserPagesByWorkspace, pageById)
+  return pageById.get(pageId) ?? null
 }
 
 export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = (set, get) => ({
@@ -419,8 +461,9 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
 
       const shouldActivate = options?.activate ?? true
       const shouldUpdateGlobalActiveSurface = shouldActivate && s.activeWorktreeId === worktreeId
+      const shouldFocusFloatingTab = shouldActivate && worktreeId === FLOATING_TERMINAL_WORKTREE_ID
       const shouldFocusAddressBar =
-        shouldUpdateGlobalActiveSurface &&
+        (shouldUpdateGlobalActiveSurface || shouldFocusFloatingTab) &&
         (options?.focusAddressBar ??
           (page.url === 'about:blank' || page.url === ORCA_BROWSER_BLANK_URL))
 
@@ -437,7 +480,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
           ...s.tabBarOrderByWorktree,
           [worktreeId]: nextTabBarOrder
         },
-        activeBrowserTabId: shouldActivate ? workspaceId : s.activeBrowserTabId,
+        activeBrowserTabId: shouldUpdateGlobalActiveSurface ? workspaceId : s.activeBrowserTabId,
         activeBrowserTabIdByWorktree: {
           ...s.activeBrowserTabIdByWorktree,
           [worktreeId]: shouldActivate
@@ -472,10 +515,39 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       state.createUnifiedTab(worktreeId, 'browser', {
         entityId: workspaceId,
         label: browserTab.title,
-        targetGroupId: options?.targetGroupId
+        targetGroupId: options?.targetGroupId,
+        activate: options?.activate ?? true
       })
     }
     return browserTab
+  },
+
+  openNewBrowserTabInActiveWorkspace: async (groupId) => {
+    const state = get()
+    const worktreeId = state.activeWorktreeId
+    if (!worktreeId) {
+      return
+    }
+    const defaultUrl = state.browserDefaultUrl ?? 'about:blank'
+    const pairedWebRuntimeEnvironmentId = (globalThis as { __ORCA_WEB_CLIENT__?: boolean })
+      .__ORCA_WEB_CLIENT__
+      ? state.settings?.activeRuntimeEnvironmentId?.trim()
+      : null
+    if (pairedWebRuntimeEnvironmentId) {
+      const { createWebRuntimeSessionBrowserTab } = await import('@/runtime/web-runtime-session')
+      await createWebRuntimeSessionBrowserTab({
+        worktreeId,
+        environmentId: pairedWebRuntimeEnvironmentId,
+        url: defaultUrl,
+        targetGroupId: groupId
+      })
+      return
+    }
+    get().createBrowserTab(worktreeId, defaultUrl, {
+      title: 'New Browser Tab',
+      focusAddressBar: true,
+      targetGroupId: groupId
+    })
   },
 
   closeBrowserTab: (tabId) => {
@@ -689,13 +761,13 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       })
     }
 
-    // Activate the originally-active page if it wasn't the first one
+    // Why: duplicate URLs are valid browser pages; restoring by URL can select
+    // the wrong copy. The restore path preserves page order, so map by index.
     const activePageId = snap.activePageId
     if (activePageId) {
       const restoredPages = get().browserPagesByWorkspace[restored.id] ?? []
-      const targetPage = restoredPages.find(
-        (p) => p.url === pages.find((orig) => orig.id === activePageId)?.url
-      )
+      const activePageIndex = pages.findIndex((orig) => orig.id === activePageId)
+      const targetPage = activePageIndex >= 0 ? restoredPages[activePageIndex] : null
       if (targetPage && targetPage.id !== restoredPages[0]?.id) {
         get().setActiveBrowserPage(restored.id, targetPage.id)
       }
@@ -1093,53 +1165,102 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       if (!workspace) {
         return s
       }
-      const nextPages = (s.browserPagesByWorkspace[workspace.id] ?? []).map((entry) =>
-        entry.id === pageId
-          ? {
-              ...entry,
-              title:
-                updates.title === undefined
-                  ? entry.title
-                  : normalizeBrowserTitle(updates.title, entry.url),
-              loading: updates.loading ?? entry.loading,
-              faviconUrl: updates.faviconUrl === undefined ? entry.faviconUrl : updates.faviconUrl,
-              canGoBack: updates.canGoBack ?? entry.canGoBack,
-              canGoForward: updates.canGoForward ?? entry.canGoForward,
-              loadError: updates.loadError === undefined ? entry.loadError : updates.loadError
-            }
-          : entry
-      )
+      const nextPage = {
+        ...page,
+        title:
+          updates.title === undefined ? page.title : normalizeBrowserTitle(updates.title, page.url),
+        loading: updates.loading ?? page.loading,
+        faviconUrl: updates.faviconUrl === undefined ? page.faviconUrl : updates.faviconUrl,
+        canGoBack: updates.canGoBack ?? page.canGoBack,
+        canGoForward: updates.canGoForward ?? page.canGoForward,
+        loadError: updates.loadError === undefined ? page.loadError : updates.loadError
+      }
+      const unifiedTabs = s.unifiedTabsByWorktree[workspace.worktreeId] ?? []
+      const unifiedIndex =
+        workspace.activePageId === pageId && updates.title !== undefined
+          ? unifiedTabs.findIndex(
+              (entry) => entry.contentType === 'browser' && entry.entityId === workspace.id
+            )
+          : -1
+      const unifiedLabelNeedsRepair =
+        unifiedIndex !== -1 && unifiedTabs[unifiedIndex]?.label !== nextPage.title
+      const pageStateUnchanged =
+        nextPage.title === page.title &&
+        nextPage.loading === page.loading &&
+        nextPage.faviconUrl === page.faviconUrl &&
+        nextPage.canGoBack === page.canGoBack &&
+        nextPage.canGoForward === page.canGoForward &&
+        nextPage.loadError === page.loadError
+      const currentPages = s.browserPagesByWorkspace[workspace.id] ?? []
+      const mirroredWorkspace = pageStateUnchanged
+        ? mirrorWorkspaceFromActivePage(workspace, currentPages)
+        : null
+      const workspaceNeedsRepair =
+        mirroredWorkspace !== null &&
+        !browserWorkspaceMirrorFieldsEqual(workspace, mirroredWorkspace)
+      if (pageStateUnchanged && !unifiedLabelNeedsRepair && !workspaceNeedsRepair) {
+        return s
+      }
+      if (pageStateUnchanged) {
+        const nextState: Partial<AppState> = {}
+        if (workspaceNeedsRepair && mirroredWorkspace) {
+          nextState.browserTabsByWorktree = {
+            ...s.browserTabsByWorktree,
+            [workspace.worktreeId]: (s.browserTabsByWorktree[workspace.worktreeId] ?? []).map(
+              (tab) => (tab.id === workspace.id ? mirroredWorkspace : tab)
+            )
+          }
+        }
+        if (unifiedLabelNeedsRepair) {
+          nextState.unifiedTabsByWorktree = {
+            ...s.unifiedTabsByWorktree,
+            [workspace.worktreeId]: unifiedTabs.map((entry, index) =>
+              index === unifiedIndex ? { ...entry, label: nextPage.title } : entry
+            )
+          }
+        }
+        return nextState
+      }
+      const nextPages = currentPages.map((entry) => (entry.id === pageId ? nextPage : entry))
       const nextWorkspace = mirrorWorkspaceFromActivePage(workspace, nextPages)
-      return {
+      const nextState: Partial<AppState> = {
         browserPagesByWorkspace: {
           ...s.browserPagesByWorkspace,
           [workspace.id]: nextPages
-        },
-        browserTabsByWorktree: {
+        }
+      }
+      if (!browserWorkspaceMirrorFieldsEqual(workspace, nextWorkspace)) {
+        nextState.browserTabsByWorktree = {
           ...s.browserTabsByWorktree,
           [workspace.worktreeId]: (s.browserTabsByWorktree[workspace.worktreeId] ?? []).map((tab) =>
             tab.id === workspace.id ? nextWorkspace : tab
           )
         }
       }
+      if (workspace.activePageId === pageId && updates.title !== undefined && unifiedIndex !== -1) {
+        if (unifiedLabelNeedsRepair || unifiedTabs[unifiedIndex]?.label !== nextWorkspace.title) {
+          nextState.unifiedTabsByWorktree = {
+            ...s.unifiedTabsByWorktree,
+            [workspace.worktreeId]: unifiedTabs.map((entry, index) =>
+              index === unifiedIndex ? { ...entry, label: nextWorkspace.title } : entry
+            )
+          }
+        }
+      }
+      return nextState
     })
-
-    const page = findPage(get().browserPagesByWorkspace, pageId)
-    if (!page) {
-      return
-    }
-    const workspace = findWorkspace(get().browserTabsByWorktree, page.workspaceId)
-    const item = Object.values(get().unifiedTabsByWorktree)
-      .flat()
-      .find((entry) => entry.contentType === 'browser' && entry.entityId === page.workspaceId)
-    if (item && workspace && workspace.activePageId === pageId && updates.title) {
-      get().setTabLabel(item.id, workspace.title)
-    }
   },
 
   setBrowserTabUrl: (pageId, url) => get().setBrowserPageUrl(pageId, url),
 
-  setBrowserPageUrl: (pageId, url) =>
+  setBrowserPageUrl: (pageId, url) => {
+    const nextUrl = normalizeUrl(url)
+    if (nextUrl !== 'about:blank' && nextUrl !== ORCA_BROWSER_BLANK_URL) {
+      const currentPage = findPage(get().browserPagesByWorkspace, pageId)
+      if (currentPage) {
+        get().recordFeatureInteraction?.('browser')
+      }
+    }
     set((s) => {
       const page = findPage(s.browserPagesByWorkspace, pageId)
       if (!page) {
@@ -1149,7 +1270,6 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
       if (!workspace) {
         return s
       }
-      const nextUrl = normalizeUrl(url)
       // Why: annotations point at DOM coordinates from one loaded document.
       // A real URL change invalidates those markers and copied context.
       const shouldClearAnnotations = normalizeUrl(page.url) !== nextUrl
@@ -1186,7 +1306,8 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
           ? { browserAnnotationsByPageId: nextBrowserAnnotationsByPageId }
           : {})
       }
-    }),
+    })
+  },
 
   setRemoteBrowserPageHandle: (pageId, handle) => {
     set((s) => ({
@@ -1287,6 +1408,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         .flat()
         .map((worktree) => worktree.id)
     )
+    validWorktreeIdsForCleanup.add(FLOATING_TERMINAL_WORKTREE_ID)
 
     // Why: mirror closeBrowserTab's contract — reducers are pure, imperative
     // side effects bracket them. Compute dropped workspaces first, destroy
@@ -1315,6 +1437,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
           .flat()
           .map((worktree) => worktree.id)
       )
+      validWorktreeIds.add(FLOATING_TERMINAL_WORKTREE_ID)
 
       const browserTabsByWorktree: Record<string, BrowserWorkspace[]> = {}
       const browserPagesByWorkspace: Record<string, BrowserPage[]> = {}
@@ -1453,7 +1576,8 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         if (!exists) {
           state.createUnifiedTab(worktreeId, 'browser', {
             entityId: bt.id,
-            label: bt.title
+            label: bt.title,
+            recordInteraction: false
           })
         }
       }
@@ -1602,6 +1726,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         profileId
       })) as BrowserCookieImportResult
       if (result.ok) {
+        get().recordFeatureInteraction?.('cookie-import')
         set({
           browserSessionImportState: {
             profileId,
@@ -1745,6 +1870,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
         browserProfile
       })) as BrowserCookieImportResult
       if (result.ok) {
+        get().recordFeatureInteraction?.('cookie-import')
         set({
           browserSessionImportState: {
             profileId,
@@ -1801,6 +1927,7 @@ export const createBrowserSlice: StateCreator<AppState, [], [], BrowserSlice> = 
     try {
       const ok = await window.api.browser.sessionClearDefaultCookies()
       if (ok) {
+        get().recordFeatureInteraction?.('cookie-import')
         await get().fetchBrowserSessionProfiles()
       }
       return ok

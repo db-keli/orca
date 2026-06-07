@@ -1,16 +1,9 @@
 import { useCallback } from 'react'
-import { toast } from 'sonner'
 import { track } from '@/lib/telemetry'
-import { ONBOARDING_FINAL_STEP } from '../../../../shared/constants'
+import { useAppStore } from '@/store'
+import { ONBOARDING_FINAL_STEP, ONBOARDING_FLOW_VERSION } from '../../../../shared/constants'
+import type { EventProps } from '../../../../shared/telemetry-events'
 import type { GlobalSettings, OnboardingState, TuiAgent } from '../../../../shared/types'
-import type { NotificationDraft } from './NotificationStep'
-import {
-  hasSelectedOnboardingFeatureSetup,
-  onboardingFeatureSetupRunTelemetry,
-  runOnboardingFeatureSetup,
-  type OnboardingFeatureSetupResult,
-  type OnboardingFeatureSetupSelection
-} from './onboarding-feature-setup'
 import type { StepId, StepNumber } from './use-onboarding-flow-types'
 
 export async function persistStep(
@@ -18,6 +11,7 @@ export async function persistStep(
   updates: Partial<OnboardingState> = {}
 ): Promise<OnboardingState> {
   return window.api.onboarding.update({
+    flowVersion: ONBOARDING_FLOW_VERSION,
     lastCompletedStep: Math.max(stepNumber, -1),
     ...updates
   })
@@ -35,8 +29,30 @@ type CloseWithDeps = {
 }
 
 export type DismissedExtras = {
-  advancedVia: 'button' | 'keyboard'
+  advancedVia: NonNullable<EventProps<'onboarding_dismissed'>['advanced_via']>
   durationMs: number
+}
+
+export function buildOnboardingDismissedPayload(
+  lastStepReached: StepNumber,
+  dismissedExtras?: DismissedExtras
+): EventProps<'onboarding_dismissed'> {
+  return {
+    last_step: lastStepReached,
+    ...(dismissedExtras
+      ? {
+          duration_ms: dismissedExtras.durationMs,
+          advanced_via: dismissedExtras.advancedVia
+        }
+      : {})
+  }
+}
+
+export function trackOnboardingDismissed(
+  lastStepReached: StepNumber,
+  dismissedExtras?: DismissedExtras
+): void {
+  track('onboarding_dismissed', buildOnboardingDismissedPayload(lastStepReached, dismissedExtras))
 }
 
 export function useCloseWith({
@@ -50,7 +66,7 @@ export function useCloseWith({
       outcome: 'completed' | 'dismissed',
       checklist: Partial<OnboardingState['checklist']>,
       lastStepReached: StepNumber,
-      completedPath?: 'open_folder' | 'clone_url',
+      completedPath?: 'open_folder' | 'clone_url' | 'add_project_modal',
       dismissedExtras?: DismissedExtras
     ): Promise<boolean> => {
       let nextState: OnboardingState
@@ -59,6 +75,7 @@ export function useCloseWith({
         // so spreading the local (potentially stale) onboarding.checklist would
         // overwrite concurrent updates.
         nextState = await window.api.onboarding.update({
+          flowVersion: ONBOARDING_FLOW_VERSION,
           closedAt: Date.now(),
           outcome,
           lastCompletedStep: outcome === 'completed' ? ONBOARDING_FINAL_STEP : -1,
@@ -96,15 +113,7 @@ export function useCloseWith({
           })
         }
       } else if (outcome === 'dismissed') {
-        track('onboarding_dismissed', {
-          last_step: lastStepReached,
-          ...(dismissedExtras
-            ? {
-                duration_ms: dismissedExtras.durationMs,
-                advanced_via: dismissedExtras.advancedVia
-              }
-            : {})
-        })
+        trackOnboardingDismissed(lastStepReached, dismissedExtras)
       }
       return true
     },
@@ -116,8 +125,6 @@ type PersistCurrentStepDeps = {
   currentStepId: StepId
   selectedAgent: TuiAgent | null
   theme: GlobalSettings['theme']
-  notifications: NotificationDraft
-  featureSetupSelection: OnboardingFeatureSetupSelection
   settings: GlobalSettings | null
   updateSettings: (updates: Partial<GlobalSettings>) => Promise<void> | void
   onboardingChecklist: OnboardingState['checklist']
@@ -127,15 +134,12 @@ type PersistCurrentStepDeps = {
 
 export type PersistCurrentStepResult = {
   ok: boolean
-  featureSetupResult?: OnboardingFeatureSetupResult
 }
 
 export function usePersistCurrentStep({
   currentStepId,
   selectedAgent,
   theme,
-  notifications,
-  featureSetupSelection,
   settings,
   updateSettings,
   onboardingChecklist,
@@ -171,45 +175,25 @@ export function usePersistCurrentStep({
         return { ok: true }
       }
       if (currentStepId === 'notifications') {
-        const enabled = notifications.agentTaskComplete || notifications.terminalBell
-        if (enabled) {
-          // Why: triggers macOS first-prompt notification on first call. Only fire
-          // on Continue; Skip uses the persistence-only path below.
-          await window.api.notifications.requestPermission()
-        }
         await updateSettings({
           notifications: {
             ...settings.notifications,
-            enabled,
-            agentTaskComplete: notifications.agentTaskComplete,
-            terminalBell: notifications.terminalBell,
-            // Why: invert positive UX framing back to persisted negative field.
-            suppressWhenFocused: !notifications.notifyWhenFocused
+            enabled: true,
+            agentTaskComplete: true,
+            terminalBell: true
           }
         })
-        const setupResult = await runOnboardingFeatureSetup(featureSetupSelection)
-        const featureSetupResult: OnboardingFeatureSetupResult = setupResult
-        track('onboarding_feature_setup_run', {
-          ...onboardingFeatureSetupRunTelemetry(featureSetupSelection, setupResult)
-        })
-        if (hasSelectedOnboardingFeatureSetup(featureSetupSelection)) {
-          const firstWarning = setupResult.warnings[0]
-          if (firstWarning) {
-            toast.warning('Some feature setup needs attention', {
-              description: firstWarning.message
-            })
-          }
-          if (setupResult.skillCommandsCopied) {
-            toast.success('Feature setup ready', {
-              description: 'Skill command copied and inserted below for review.'
-            })
-          }
-          if (setupResult.computerUsePermissionsOpened) {
-            toast.message('Opened Computer Use permissions')
-          }
-        }
+        useAppStore.getState().recordFeatureInteraction('notifications')
+        onOnboardingChange(await persistStep(4))
+        return { ok: true }
+      }
+      if (currentStepId === 'integrations') {
+        // Why: GitHub and Linear connections persist through their own
+        // store slices when the user actually wires them up. The step itself
+        // is a no-op for settings/onboarding state beyond marking it
+        // completed.
         onOnboardingChange(await persistStep(3))
-        return { ok: true, featureSetupResult }
+        return { ok: true }
       }
       return { ok: false }
     } catch (err) {
@@ -218,8 +202,6 @@ export function usePersistCurrentStep({
     }
   }, [
     currentStepId,
-    featureSetupSelection,
-    notifications,
     onboardingChecklist,
     onOnboardingChange,
     selectedAgent,

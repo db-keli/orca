@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { isTuiAgent } from '../../../../shared/tui-agent-config'
+import type { TuiAgent } from '../../../../shared/types'
 import { defineMethod, defineStreamingMethod, type RpcAnyMethod } from '../core'
 
 const WorktreeTabSelector = z.object({
@@ -12,14 +14,57 @@ const ActivateTab = WorktreeTabSelector.extend({
   tabId: z
     .unknown()
     .transform((v) => (typeof v === 'string' ? v : ''))
-    .pipe(z.string().min(1, 'Missing tab id'))
+    .pipe(z.string().min(1, 'Missing tab id')),
+  leafId: z.string().max(128).optional()
 })
 
 const CreateTerminalTab = WorktreeTabSelector.extend({
   afterTabId: z.string().optional(),
+  targetGroupId: z.string().optional(),
   command: z.string().optional(),
+  agent: z
+    .custom<TuiAgent>(isTuiAgent, {
+      message: 'Unknown agent preset'
+    })
+    .optional(),
   activate: z.boolean().optional()
 })
+
+const MoveTabBase = {
+  worktree: WorktreeTabSelector.shape.worktree,
+  tabId: z
+    .unknown()
+    .transform((v) => (typeof v === 'string' ? v : ''))
+    .pipe(z.string().min(1, 'Missing tab id')),
+  targetGroupId: z
+    .unknown()
+    .transform((v) => (typeof v === 'string' ? v : ''))
+    .pipe(z.string().min(1, 'Missing target group id'))
+} as const
+
+const MoveTab = z.discriminatedUnion('kind', [
+  z
+    .object({
+      ...MoveTabBase,
+      kind: z.literal('reorder'),
+      tabOrder: z.array(z.string().min(1)).min(1, 'Missing tab order')
+    })
+    .strict(),
+  z
+    .object({
+      ...MoveTabBase,
+      kind: z.literal('move-to-group'),
+      index: z.number().int().nonnegative().optional()
+    })
+    .strict(),
+  z
+    .object({
+      ...MoveTabBase,
+      kind: z.literal('split'),
+      splitDirection: z.enum(['left', 'right', 'up', 'down'])
+    })
+    .strict()
+])
 
 const SaveMarkdownTab = ActivateTab.extend({
   baseVersion: z
@@ -46,7 +91,7 @@ export const SESSION_TAB_METHODS: RpcAnyMethod[] = [
     name: 'session.tabs.activate',
     params: ActivateTab,
     handler: async (params, { runtime }) =>
-      runtime.activateMobileSessionTab(params.worktree, params.tabId)
+      runtime.activateMobileSessionTab(params.worktree, params.tabId, params.leafId)
   }),
   defineMethod({
     name: 'session.tabs.close',
@@ -60,9 +105,40 @@ export const SESSION_TAB_METHODS: RpcAnyMethod[] = [
     handler: async (params, { runtime }) =>
       runtime.createMobileSessionTerminal(params.worktree, {
         afterTabId: params.afterTabId,
+        targetGroupId: params.targetGroupId,
         command: params.command,
+        agent: params.agent,
         activate: params.activate
       })
+  }),
+  defineMethod({
+    name: 'session.tabs.move',
+    params: MoveTab,
+    handler: async (params, { runtime }) => {
+      const base = {
+        tabId: params.tabId,
+        targetGroupId: params.targetGroupId
+      }
+      if (params.kind === 'reorder') {
+        return runtime.moveMobileSessionTab(params.worktree, {
+          ...base,
+          kind: 'reorder',
+          tabOrder: params.tabOrder
+        })
+      }
+      if (params.kind === 'split') {
+        return runtime.moveMobileSessionTab(params.worktree, {
+          ...base,
+          kind: 'split',
+          splitDirection: params.splitDirection
+        })
+      }
+      return runtime.moveMobileSessionTab(params.worktree, {
+        ...base,
+        kind: 'move-to-group',
+        index: params.index
+      })
+    }
   }),
   defineStreamingMethod({
     name: 'session.tabs.subscribe',

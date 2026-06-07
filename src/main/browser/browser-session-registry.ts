@@ -3,6 +3,7 @@
    per-partition permission/download policies. Splitting further would scatter the
    security boundary across modules. */
 import { app, session } from 'electron'
+import type { Session } from 'electron'
 import { randomUUID } from 'node:crypto'
 import {
   copyFileSync,
@@ -19,6 +20,11 @@ import type { BrowserSessionProfile, BrowserSessionProfileScope } from '../../sh
 import { browserManager } from './browser-manager'
 import { hasSystemMediaAccess, requestSystemMediaAccess } from './browser-media-access'
 import { cleanElectronUserAgent, setupClientHintsOverride } from './browser-session-ua'
+import {
+  allowsBrowserWebAuthnPermission,
+  clearBrowserWebAuthnAccessHandlers,
+  installBrowserWebAuthnAccessHandlers
+} from './browser-webauthn-access'
 
 type BrowserSessionMeta = {
   defaultSource: BrowserSessionProfile['source']
@@ -134,16 +140,17 @@ class BrowserSessionRegistry {
     }
   }
 
-  // Why: the User-Agent must be set on the session BEFORE any webview loads,
-  // otherwise the first request uses Electron's default UA and the server may
-  // invalidate the imported session cookies.
+  // Why: browser sessions must be initialized BEFORE any webview loads.
+  // Permission/download policies must exist before sites request capabilities,
+  // and the User-Agent must be set before the first request so imported session
+  // cookies are not invalidated by Electron's default UA.
   //
   // Why this also refreshes defaultSource: the singleton constructor runs at
   // module-import time, which may be before app.isReady(). app.getPath('userData')
   // is not guaranteed before ready, so the constructor's loadPersistedSource()
-  // silently returns null. Re-reading here (called from registerCoreHandlers,
-  // after app is ready) ensures the default profile's source is populated.
-  restorePersistedUserAgent(): void {
+  // silently returns null. Re-reading here after app readiness ensures the
+  // default profile's source is populated.
+  initializeBrowserSessionsFromPersistedState(): void {
     const meta = this.loadPersistedMeta()
     if (meta.defaultSource) {
       const current = this.profiles.get('default')
@@ -154,6 +161,13 @@ class BrowserSessionRegistry {
     if (meta.profiles.length > 0) {
       this.hydrateFromPersisted(meta.profiles)
     }
+
+    // Why: the default partition is created in the constructor but never gets
+    // session policies (permission handlers, download handlers, etc.) because
+    // hydrateFromPersisted skips the default partition and createProfile never
+    // targets it. Without this, clipboard permissions and other guest policies
+    // are denied by default in the default browser partition.
+    this.setupSessionPolicies(ORCA_BROWSER_PARTITION)
 
     const partitions = new Set([
       ORCA_BROWSER_PARTITION,
@@ -191,10 +205,14 @@ class BrowserSessionRegistry {
       if (pendingEntries.length === 0) {
         return
       }
-      const knownPartitions = new Set([
-        ORCA_BROWSER_PARTITION,
-        ...meta.profiles.map((p) => p.partition)
-      ])
+      // Why: replay writes to partition-derived file paths, so corrupted
+      // metadata must pass the same validation as the webview allowlist.
+      const knownPartitions = new Set([ORCA_BROWSER_PARTITION])
+      for (const profile of meta.profiles) {
+        if (BrowserSessionRegistry.isValidPersistedProfile(profile)) {
+          knownPartitions.add(profile.partition)
+        }
+      }
       const remainingEntries = { ...meta.pendingCookieImports }
 
       for (const [partition, stagedPath] of pendingEntries) {
@@ -374,6 +392,7 @@ class BrowserSessionRegistry {
     // lingering after the user deletes an imported or isolated session profile.
     try {
       const sess = session.fromPartition(profile.partition)
+      this.clearSessionPolicies(profile.partition, sess)
       await sess.clearStorageData()
       await sess.clearCache()
     } catch {
@@ -424,17 +443,24 @@ class BrowserSessionRegistry {
   // registering anything.
   private static readonly PARTITION_RE = /^persist:orca-browser-session-[\da-f-]{36}$/
 
+  private static isValidPersistedProfile(profile: unknown): profile is BrowserSessionProfile {
+    if (!profile || typeof profile !== 'object') {
+      return false
+    }
+    const candidate = profile as Partial<BrowserSessionProfile>
+    return (
+      candidate.id !== 'default' &&
+      candidate.scope !== 'default' &&
+      typeof candidate.id === 'string' &&
+      typeof candidate.partition === 'string' &&
+      typeof candidate.label === 'string' &&
+      BrowserSessionRegistry.PARTITION_RE.test(candidate.partition)
+    )
+  }
+
   hydrateFromPersisted(profiles: BrowserSessionProfile[]): void {
     for (const profile of profiles) {
-      if (profile.id === 'default' || profile.scope === 'default') {
-        continue
-      }
-      if (
-        typeof profile.id !== 'string' ||
-        typeof profile.partition !== 'string' ||
-        typeof profile.label !== 'string' ||
-        !BrowserSessionRegistry.PARTITION_RE.test(profile.partition)
-      ) {
+      if (!BrowserSessionRegistry.isValidPersistedProfile(profile)) {
         continue
       }
       this.profiles.set(profile.id, profile)
@@ -444,17 +470,22 @@ class BrowserSessionRegistry {
     }
   }
 
-  // Why: each non-default partition needs the same deny-by-default permission
-  // and download policies as the shared partition. Without this, newly created
-  // session partitions would silently allow permissions and downloads that the
-  // shared partition correctly denies.
+  // Why: every browser partition needs the same deny-by-default permission
+  // and download policies. Keeping the installer here prevents the default
+  // partition and imported/isolated partitions from drifting apart.
   private readonly configuredPartitions = new Set<string>()
+  private readonly handleWillDownload = (
+    _event: Electron.Event,
+    item: Electron.DownloadItem,
+    webContents: Electron.WebContents
+  ): void => {
+    browserManager.handleGuestWillDownload({ guestWebContentsId: webContents.id, item })
+  }
 
   private setupSessionPolicies(partition: string): void {
     if (this.configuredPartitions.has(partition)) {
       return
     }
-    this.configuredPartitions.add(partition)
 
     const sess = session.fromPartition(partition)
     if (typeof sess.getUserAgent === 'function') {
@@ -462,9 +493,9 @@ class BrowserSessionRegistry {
       sess.setUserAgent(cleanUA)
       setupClientHintsOverride(sess, cleanUA)
     }
-    // Why: clipboard-read and clipboard-sanitized-write are required for agent-browser's
-    // clipboard commands to work. Without these, navigator.clipboard.writeText/readText
-    // throws NotAllowedError even when invoked via CDP with userGesture:true.
+    // Why: agent-browser clipboard commands execute via CDP in this session.
+    // Until there is a separate trusted bridge, denying clipboard-read breaks
+    // those runtime commands even when invoked with a user gesture.
     const autoGranted = new Set(['fullscreen', 'clipboard-read', 'clipboard-sanitized-write'])
     sess.setPermissionRequestHandler((webContents, permission, callback, details) => {
       // Why: `media` (camera/mic) must defer to macOS TCC instead of being
@@ -513,14 +544,30 @@ class BrowserSessionRegistry {
       if (permission === 'media') {
         return hasSystemMediaAccess(details?.mediaType)
       }
+      if (allowsBrowserWebAuthnPermission(permission, details)) {
+        return true
+      }
       return autoGranted.has(permission)
     })
+    installBrowserWebAuthnAccessHandlers(sess)
     sess.setDisplayMediaRequestHandler((_request, callback) => {
       callback({ video: undefined, audio: undefined })
     })
-    sess.on('will-download', (_event, item, webContents) => {
-      browserManager.handleGuestWillDownload({ guestWebContentsId: webContents.id, item })
-    })
+    sess.removeListener('will-download', this.handleWillDownload)
+    sess.on('will-download', this.handleWillDownload)
+    this.configuredPartitions.add(partition)
+  }
+
+  private clearSessionPolicies(partition: string, sess: Session): void {
+    // Why: isolated/imported browser partitions can be deleted while the
+    // Electron Session object survives; clear policy callbacks and listener
+    // bookkeeping so removed profiles do not leave retained closures behind.
+    this.configuredPartitions.delete(partition)
+    sess.removeListener('will-download', this.handleWillDownload)
+    clearBrowserWebAuthnAccessHandlers(sess)
+    sess.setPermissionRequestHandler(null)
+    sess.setPermissionCheckHandler(null)
+    sess.setDisplayMediaRequestHandler(null)
   }
 }
 

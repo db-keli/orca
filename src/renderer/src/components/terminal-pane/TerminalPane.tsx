@@ -7,13 +7,14 @@ import { X } from 'lucide-react'
 import { useAppStore } from '../../store'
 import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { DaemonActionDialog, useDaemonActions } from '@/components/shared/useDaemonActions'
 import {
   DEFAULT_TERMINAL_DIVIDER_DARK,
   isTerminalBackgroundLight,
   normalizeColor,
   resolveEffectiveTerminalAppearance
 } from '@/lib/terminal-theme'
-import type { PaneManager } from '@/lib/pane-manager/pane-manager'
+import type { ManagedPane, PaneManager } from '@/lib/pane-manager/pane-manager'
 import TerminalSearch from '@/components/TerminalSearch'
 import type { PtyTransport } from './pty-transport'
 import { fitPanes, isWindowsUserAgent, shellEscapePath } from './pane-helpers'
@@ -23,6 +24,7 @@ import { EMPTY_LAYOUT, serializeTerminalLayout } from './layout-serialization'
 import { makePaneKey } from '../../../../shared/stable-pane-id'
 import {
   applyExpandedLayoutTo,
+  cancelPendingPaneSizeRefreshFrames,
   createExpandCollapseActions,
   restoreExpandedLayoutFrom
 } from './expand-collapse'
@@ -35,10 +37,12 @@ import { MobileDriverOverlay } from './MobileDriverOverlay'
 import { TerminalErrorToast } from './TerminalErrorToast'
 import { TerminalSessionStateSaveFailureDialog } from './TerminalSessionStateSaveFailureDialog'
 import TerminalContextMenu from './TerminalContextMenu'
+import { TerminalAgentSessionForkDialog } from './TerminalAgentSessionForkDialog'
 import { useSystemPrefersDark } from './use-system-prefers-dark'
 import { useTerminalPaneGlobalEffects } from './use-terminal-pane-global-effects'
 import { useTerminalPaneLifecycle } from './use-terminal-pane-lifecycle'
 import { useTerminalPaneContextMenu } from './use-terminal-pane-context-menu'
+import type { PreparedAgentSessionFork } from './terminal-agent-session-fork'
 import { useNotificationDispatch } from './use-notification-dispatch'
 import { connectPanePty } from './pty-connection'
 import { shouldPreserveTerminalScrollbackBuffers } from '../../../../shared/workspace-session-terminal-buffers'
@@ -53,6 +57,7 @@ import {
   getRemoteRuntimePtyEnvironmentId,
   getRemoteRuntimeTerminalHandle
 } from '@/runtime/runtime-terminal-stream'
+import { closeWebRuntimeTerminal } from '@/runtime/web-runtime-session'
 import { isPrimarySelectionEnabled, readPrimarySelectionText } from '@/lib/primary-selection'
 import { WORKSPACE_FILE_PATH_MIME } from '@/lib/workspace-file-drag'
 import { isTerminalSessionStateSaveFailure } from '../../../../shared/terminal-session-state-save-failure'
@@ -60,12 +65,35 @@ import {
   isSyntheticSinglePaneTitle,
   sanitizeTerminalLayoutPaneTitles
 } from '@/lib/terminal-pane-title-sanitization'
+import { planTerminalLiveLayoutInsertions } from './terminal-live-layout-reconciliation'
+import type { TerminalQuickCommand, TerminalQuickCommandScope } from '../../../../shared/types'
+import { FLOATING_TERMINAL_WORKTREE_ID } from '../../../../shared/constants'
+import { getRepoIdFromWorktreeId } from '../../../../shared/worktree-id'
+import {
+  getTerminalQuickCommandScope,
+  isTerminalQuickCommandComplete,
+  terminalQuickCommandMatchesRepo
+} from '../../../../shared/terminal-quick-commands'
+import {
+  createTerminalQuickCommandDraft,
+  TerminalQuickCommandDialog
+} from '@/components/terminal-quick-commands/TerminalQuickCommandDialog'
+import { keybindingMatchesAction } from '../../../../shared/keybindings'
+import { pasteTerminalClipboard } from './terminal-clipboard-paste'
 
 // Why: registry lives in a leaf module so the store slice can import it
 // without re-entering the `slice → TerminalPane → store → slice` cycle
 // that otherwise leaves createTerminalSlice undefined at store-init time.
 import { shutdownBufferCaptures } from './shutdown-buffer-captures'
 import { mergeCapturedLeafState } from './merge-captured-leaf-state'
+import { pasteTerminalText } from './terminal-bracketed-paste'
+import {
+  applyTerminalPaneAttentionToManager,
+  subscribeTerminalPaneAttention
+} from './terminal-pane-attention-subscriptions'
+import { getCachedTerminalTabForWorktree } from './terminal-tab-lookup'
+import { getCachedTerminalGroupIdForWorktree } from './terminal-unified-tab-lookup'
+import { useRepoById } from '@/store/selectors'
 
 type TerminalPaneProps = {
   tabId: string
@@ -83,9 +111,38 @@ type TerminalPaneProps = {
   onCloseTab: () => void
 }
 
+type TerminalQuickCommandEditorDialogProps = {
+  command: TerminalQuickCommand
+  onOpenChange: (open: boolean) => void
+  onSave: (command: TerminalQuickCommand) => void
+}
+
+function TerminalQuickCommandEditorDialog({
+  command,
+  onOpenChange,
+  onSave
+}: TerminalQuickCommandEditorDialogProps): React.JSX.Element {
+  const repos = useAppStore((store) => store.repos)
+
+  return (
+    <TerminalQuickCommandDialog
+      open
+      mode="add"
+      command={command}
+      repos={repos}
+      onOpenChange={onOpenChange}
+      onSave={onSave}
+    />
+  )
+}
+
 function formatClipboardImagePasteError(error: unknown): string {
   const detail = error instanceof Error ? error.message : String(error)
   return `Image paste failed: ${detail}`
+}
+
+function isXtermHelperTextarea(target: EventTarget | null): target is HTMLElement {
+  return target instanceof HTMLElement && target.classList.contains('xterm-helper-textarea')
 }
 
 export default function TerminalPane({
@@ -105,6 +162,7 @@ export default function TerminalPane({
   const expandedStyleSnapshotRef = useRef<Map<HTMLElement, { display: string; flex: string }>>(
     new Map()
   )
+  const pendingPaneSizeRefreshFrameIdsRef = useRef<number[]>([])
   // Why (separate from expandedStyleSnapshotRef): Activity isolation is a
   // transient view override that must not collide with the user-facing
   // expanded-pane state or the layout snapshot. Keeping its own snapshot
@@ -148,83 +206,118 @@ export default function TerminalPane({
   searchOpenRef.current = searchOpen
   const searchStateRef = useRef<SearchState>({ query: '', caseSensitive: false, regex: false })
   const [closeConfirmPaneId, setCloseConfirmPaneId] = useState<number | null>(null)
+  const [quickCommandEditorOpen, setQuickCommandEditorOpen] = useState(false)
+  // Why: the terminal menu can be the first quick-command entry point, so each
+  // Add action starts with a fresh draft instead of reusing cancelled text.
+  const [quickCommandDraft, setQuickCommandDraft] = useState(createTerminalQuickCommandDraft)
+  const [agentSessionFork, setAgentSessionFork] = useState<PreparedAgentSessionFork | null>(null)
   const [terminalError, setTerminalError] = useState<string | null>(null)
   const [sessionStateSaveFailureOpen, setSessionStateSaveFailureOpen] = useState(false)
+  const daemonActions = useDaemonActions()
   // Why: override state lives in a plain Map for perf (safeFit reads it on
   // every resize). This counter forces a re-render when overrides change so
   // the mobile-fit banner appears/disappears. When an override is cleared
   // (desktop-fit), we also trigger safeFit on affected panes so the terminal
   // resizes back to desktop dimensions.
   const [, setOverrideTick] = useState(0)
-  useEffect(
-    () =>
-      onOverrideChange((event) => {
-        setOverrideTick((n) => n + 1)
-        if (event.mode === 'desktop-fit') {
-          const manager = managerRef.current
-          if (!manager) {
-            return
-          }
-          // Why: pane IDs are per-tab, so resolve the affected PTY through this
-          // tab's live transport bindings instead of global numeric pane IDs.
-          const getAffectedPanes = (): ReturnType<typeof manager.getPanes> =>
-            manager
-              .getPanes()
-              .filter((pane) => paneTransportsRef.current.get(pane.id)?.getPtyId() === event.ptyId)
-          // Why: fitAddon.fit() measures DOM dimensions, so it must run after
-          // the browser has settled layout. Running synchronously inside the
-          // IPC callback can produce stale measurements. rAF ensures the DOM
-          // is ready. The follow-up timeout acts as a safety net: if
-          // fitAddon.fit() silently threw (its errors are caught), the timeout
-          // falls back to a direct terminal.resize() using the restored
-          // dimensions from the runtime. This guarantees xterm exits mobile
-          // dims even when the DOM-based fit path fails.
-          const fitAffectedPanes = (): void => {
-            for (const pane of getAffectedPanes()) {
-              safeFit(pane)
-            }
-          }
-          requestAnimationFrame(fitAffectedPanes)
-          // Why: belt-and-suspenders — if safeFit's fitAddon.fit() threw or
-          // was a no-op due to stale dimensions, fall back to a direct
-          // resize. ONLY fire if xterm is still parked at the prior
-          // mobile-fit dims, meaning safeFit failed to move it. Previously
-          // we also fired when xterm had moved to *any* size other than
-          // the captured baseline, which clobbered safeFit's correct
-          // DOM-measured fit when the desktop pane geometry had changed
-          // since mobile-fit started (e.g. user closed a split or resized
-          // the window while the phone was active). In that scenario the
-          // event.cols/rows is the stale baseline from the moment
-          // mobile-fit started, not the current pane geometry — applying
-          // it would shrink the terminal back to e.g. half-width.
-          setTimeout(() => {
-            for (const pane of getAffectedPanes()) {
-              // Why: skip the fallback for hidden/unmounted panes whose
-              // container is 0×0. Force-resizing xterm to the server's
-              // desktop dims while the DOM has no geometry leaves xterm
-              // with cols/rows that won't match when the tab is later
-              // activated (the activation refit will correct it). The
-              // fallback is for the *visible* pane that legitimately
-              // failed to refit via the rAF safeFit.
-              const rect = pane.container.getBoundingClientRect()
-              if (rect.width === 0 || rect.height === 0) {
-                continue
-              }
-              safeFit(pane)
-              const stuckAtMobile =
-                event.priorCols != null &&
-                event.priorRows != null &&
-                pane.terminal.cols === event.priorCols &&
-                pane.terminal.rows === event.priorRows
-              if (stuckAtMobile && event.cols > 0 && event.rows > 0) {
-                pane.terminal.resize(event.cols, event.rows)
-              }
-            }
-          }, 100)
+  useEffect(() => {
+    const pendingFitFrames = new Set<number>()
+    const pendingFallbackTimers = new Set<number>()
+
+    const scheduleFitFrame = (callback: () => void): void => {
+      const frameId = window.requestAnimationFrame(() => {
+        pendingFitFrames.delete(frameId)
+        callback()
+      })
+      pendingFitFrames.add(frameId)
+    }
+
+    const scheduleFallbackTimer = (callback: () => void): void => {
+      const timerId = window.setTimeout(() => {
+        pendingFallbackTimers.delete(timerId)
+        callback()
+      }, 100)
+      pendingFallbackTimers.add(timerId)
+    }
+
+    const unsubscribe = onOverrideChange((event) => {
+      setOverrideTick((n) => n + 1)
+      if (event.mode === 'desktop-fit') {
+        const manager = managerRef.current
+        if (!manager) {
+          return
         }
-      }),
-    []
-  )
+        // Why: pane IDs are per-tab, so resolve the affected PTY through this
+        // tab's live transport bindings instead of global numeric pane IDs.
+        const getAffectedPanes = (): ReturnType<typeof manager.getPanes> =>
+          manager
+            .getPanes()
+            .filter((pane) => paneTransportsRef.current.get(pane.id)?.getPtyId() === event.ptyId)
+        // Why: fitAddon.fit() measures DOM dimensions, so it must run after
+        // the browser has settled layout. Running synchronously inside the
+        // IPC callback can produce stale measurements. rAF ensures the DOM
+        // is ready. The follow-up timeout acts as a safety net: if
+        // fitAddon.fit() silently threw (its errors are caught), the timeout
+        // falls back to a direct terminal.resize() using the restored
+        // dimensions from the runtime. This guarantees xterm exits mobile
+        // dims even when the DOM-based fit path fails.
+        const fitAffectedPanes = (): void => {
+          for (const pane of getAffectedPanes()) {
+            safeFit(pane)
+          }
+        }
+        scheduleFitFrame(fitAffectedPanes)
+        // Why: belt-and-suspenders — if safeFit's fitAddon.fit() threw or
+        // was a no-op due to stale dimensions, fall back to a direct
+        // resize. ONLY fire if xterm is still parked at the prior
+        // mobile-fit dims, meaning safeFit failed to move it. Previously
+        // we also fired when xterm had moved to *any* size other than
+        // the captured baseline, which clobbered safeFit's correct
+        // DOM-measured fit when the desktop pane geometry had changed
+        // since mobile-fit started (e.g. user closed a split or resized
+        // the window while the phone was active). In that scenario the
+        // event.cols/rows is the stale baseline from the moment
+        // mobile-fit started, not the current pane geometry — applying
+        // it would shrink the terminal back to e.g. half-width.
+        scheduleFallbackTimer(() => {
+          for (const pane of getAffectedPanes()) {
+            // Why: skip the fallback for hidden/unmounted panes whose
+            // container is 0×0. Force-resizing xterm to the server's
+            // desktop dims while the DOM has no geometry leaves xterm
+            // with cols/rows that won't match when the tab is later
+            // activated (the activation refit will correct it). The
+            // fallback is for the *visible* pane that legitimately
+            // failed to refit via the rAF safeFit.
+            const rect = pane.container.getBoundingClientRect()
+            if (rect.width === 0 || rect.height === 0) {
+              continue
+            }
+            safeFit(pane)
+            const stuckAtMobile =
+              event.priorCols != null &&
+              event.priorRows != null &&
+              pane.terminal.cols === event.priorCols &&
+              pane.terminal.rows === event.priorRows
+            if (stuckAtMobile && event.cols > 0 && event.rows > 0) {
+              pane.terminal.resize(event.cols, event.rows)
+            }
+          }
+        })
+      }
+    })
+
+    return () => {
+      unsubscribe()
+      for (const frameId of pendingFitFrames) {
+        window.cancelAnimationFrame(frameId)
+      }
+      pendingFitFrames.clear()
+      for (const timerId of pendingFallbackTimers) {
+        window.clearTimeout(timerId)
+      }
+      pendingFallbackTimers.clear()
+    }
+  }, [])
 
   // Why: presence-lock banner re-render. Driver state lives in a plain Map
   // for perf; this counter forces a re-render when the driver flips so the
@@ -244,6 +337,7 @@ export default function TerminalPane({
   const paneTitlesRef = useRef<Record<number, string>>({})
   paneTitlesRef.current = paneTitles
   const removedTitleLeafIdsRef = useRef<Set<string>>(new Set())
+  const clearedScrollbackLeafIdsRef = useRef<Set<string>>(new Set())
   const [renamingPaneId, setRenamingPaneId] = useState<number | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const renameInputRef = useRef<HTMLInputElement>(null)
@@ -252,6 +346,11 @@ export default function TerminalPane({
   // again. Similarly, pressing Escape runs handleRenameCancel but blur would
   // then call handleRenameSubmit, saving the title the user wanted to discard.
   const renameSubmittedRef = useRef(false)
+  const renameSessionIdRef = useRef(0)
+  const renameBlurCommitEnabledRef = useRef(true)
+  const renameFocusFrameRef = useRef<number | null>(null)
+  const renameEnableBlurFrameRef = useRef<number | null>(null)
+  const renameRefocusFrameRef = useRef<number | null>(null)
   const onPtyErrorRef = useRef((_paneId: number, message: string) => {
     if (isTerminalSessionStateSaveFailure(message)) {
       setTerminalError(null)
@@ -270,8 +369,8 @@ export default function TerminalPane({
   )
   const clearCodexRestartNotice = useAppStore((store) => store.clearCodexRestartNotice)
   const savedLayout = useAppStore((store) => store.terminalLayoutsByTabId[tabId] ?? EMPTY_LAYOUT)
-  const terminalTab = useAppStore(
-    (store) => (store.tabsByWorktree[worktreeId] ?? []).find((tab) => tab.id === tabId) ?? null
+  const terminalTab = useAppStore((store) =>
+    getCachedTerminalTabForWorktree(store.tabsByWorktree, worktreeId, tabId)
   )
   const setTabLayout = useAppStore((store) => store.setTabLayout)
   const restoredLayout = useMemo(
@@ -286,17 +385,22 @@ export default function TerminalPane({
   const clearTabPtyId = useAppStore((store) => store.clearTabPtyId)
   const markWorktreeUnread = useAppStore((store) => store.markWorktreeUnread)
   const markTerminalTabUnread = useAppStore((store) => store.markTerminalTabUnread)
+  const markTerminalPaneUnread = useAppStore((store) => store.markTerminalPaneUnread)
   const clearWorktreeUnread = useAppStore((store) => store.clearWorktreeUnread)
   const clearTerminalTabUnread = useAppStore((store) => store.clearTerminalTabUnread)
+  const clearTerminalPaneUnread = useAppStore((store) => store.clearTerminalPaneUnread)
   const openSpacePage = useAppStore((store) => store.openSpacePage)
   const refreshWorkspaceSpace = useAppStore((store) => store.refreshWorkspaceSpace)
   const settings = useAppStore((store) => store.settings)
+  const updateSettings = useAppStore((store) => store.updateSettings)
+  const keybindings = useAppStore((store) => store.keybindings)
   // Why: Windows is the only platform where bare right-click is repurposed as
   // a paste gesture; on macOS/Linux the terminal still owns right-click for the
   // context menu. The settings default keeps the Windows shortcut feeling native
   // without changing the other platforms' interaction model.
   const rightClickToPaste = isWindowsUserAgent() && (settings?.terminalRightClickToPaste ?? true)
   const [startup] = useState(() => useAppStore.getState().pendingStartupByTabId[tabId])
+  const shouldMeasureHiddenStartup = startup !== undefined && !isVisible
   const consumeTabStartupCommand = useAppStore((store) => store.consumeTabStartupCommand)
   const [setupSplit] = useState(() => useAppStore.getState().pendingSetupSplitByTabId[tabId])
   const consumeTabSetupSplit = useAppStore((store) => store.consumeTabSetupSplit)
@@ -304,7 +408,6 @@ export default function TerminalPane({
     () => useAppStore.getState().pendingIssueCommandSplitByTabId[tabId]
   )
   const consumeTabIssueCommandSplit = useAppStore((store) => store.consumeTabIssueCommandSplit)
-
   useEffect(() => {
     if (startup) {
       consumeTabStartupCommand(tabId)
@@ -318,6 +421,45 @@ export default function TerminalPane({
       console.warn('Failed to refresh Space Analyzer after terminal session save failure:', err)
     })
   }, [openSpacePage, refreshWorkspaceSpace])
+
+  const quickCommandRepoId =
+    worktreeId === FLOATING_TERMINAL_WORKTREE_ID ? null : getRepoIdFromWorktreeId(worktreeId)
+  const quickCommandRepo = useRepoById(quickCommandRepoId)
+  const quickCommandRepoLabel = quickCommandRepo
+    ? quickCommandRepo.displayName || quickCommandRepo.path
+    : quickCommandRepoId
+      ? 'This Repo'
+      : null
+  const validQuickCommands = (settings?.terminalQuickCommands ?? []).filter((command) =>
+    isTerminalQuickCommandComplete(command)
+  )
+  const repoQuickCommands = validQuickCommands.filter((command) => {
+    const scope = getTerminalQuickCommandScope(command)
+    return scope.type === 'repo' && terminalQuickCommandMatchesRepo(command, quickCommandRepoId)
+  })
+  const globalQuickCommands = validQuickCommands.filter(
+    (command) => getTerminalQuickCommandScope(command).type === 'global'
+  )
+  const quickCommandGroupId =
+    useAppStore(
+      (s) =>
+        getCachedTerminalGroupIdForWorktree(s.unifiedTabsByWorktree, worktreeId, tabId) ??
+        s.activeGroupIdByWorktree[worktreeId] ??
+        null
+    ) ?? null
+
+  const openQuickCommandEditor = useCallback((scope: TerminalQuickCommandScope): void => {
+    setQuickCommandDraft(createTerminalQuickCommandDraft(scope))
+    setQuickCommandEditorOpen(true)
+  }, [])
+
+  const saveQuickCommand = useCallback(
+    (command: TerminalQuickCommand): void => {
+      const currentCommands = useAppStore.getState().settings?.terminalQuickCommands ?? []
+      void updateSettings({ terminalQuickCommands: [...currentCommands, command] })
+    },
+    [updateSettings]
+  )
 
   useEffect(() => {
     if (setupSplit) {
@@ -372,16 +514,28 @@ export default function TerminalPane({
     const existing = useAppStore.getState().terminalLayoutsByTabId[tabId]
     const currentPanes = manager.getPanes()
     const currentLeafIds = new Set(currentPanes.map((p) => p.leafId))
+    const clearedScrollbackLeafIds = clearedScrollbackLeafIdsRef.current
+    const scrollbackPreserveLeafIds = new Set(
+      [...currentLeafIds].filter((leafId) => !clearedScrollbackLeafIds.has(leafId))
+    )
     // Preserve existing buffersByLeafId so layout-only persists (resize, split,
     // reorder) don't clobber previously captured scrollback. Drop entries for
     // leaves that no longer exist.
     const mergedBuffers = mergeCapturedLeafState({
       prior: existing?.buffersByLeafId,
       fresh: {},
-      currentLeafIds
+      currentLeafIds: scrollbackPreserveLeafIds
     })
     if (Object.keys(mergedBuffers).length > 0) {
       layout.buffersByLeafId = mergedBuffers
+    }
+    const mergedScrollbackRefs = mergeCapturedLeafState({
+      prior: existing?.scrollbackRefsByLeafId,
+      fresh: {},
+      currentLeafIds: scrollbackPreserveLeafIds
+    })
+    if (Object.keys(mergedScrollbackRefs).length > 0) {
+      layout.scrollbackRefsByLeafId = mergedScrollbackRefs
     }
     // Why: between pane creation and the deferred rAF where PTYs actually
     // attach, all transports have getPtyId() === null. The merge below
@@ -429,7 +583,19 @@ export default function TerminalPane({
       layout.titlesByLeafId = titlesByLeafId
     }
     setTabLayout(tabId, layout)
+    for (const leafId of currentLeafIds) {
+      clearedScrollbackLeafIds.delete(leafId)
+    }
   }, [tabId, setTabLayout])
+
+  const clearPaneScrollback = useCallback(
+    (pane: ManagedPane): void => {
+      clearedScrollbackLeafIdsRef.current.add(pane.leafId)
+      pane.terminal.clear()
+      persistLayoutSnapshot()
+    },
+    [persistLayoutSnapshot]
+  )
 
   useEffect(() => {
     if (!terminalTab) {
@@ -519,6 +685,7 @@ export default function TerminalPane({
     expandedStyleSnapshotRef,
     containerRef,
     managerRef,
+    pendingPaneSizeRefreshFrameIdsRef,
     setExpandedPaneId,
     setTabPaneExpanded,
     tabId,
@@ -538,6 +705,8 @@ export default function TerminalPane({
         // so the sidebar doesn't show a stale countdown for a pane that no
         // longer exists. The closeTab path handles bulk cleanup, but closing
         // a single split pane doesn't go through closeTab.
+        const ptyId = paneTransportsRef.current.get(paneId)?.getPtyId() ?? null
+        closeWebRuntimeTerminal(ptyId)
         const leafId = manager.getLeafId(paneId)
         if (leafId) {
           useAppStore.getState().setCacheTimerStartedAt(makePaneKey(tabId, leafId), null)
@@ -606,6 +775,7 @@ export default function TerminalPane({
     setupSplit,
     issueCommandSplit,
     isActive,
+    isVisible,
     systemPrefersDark,
     settings,
     settingsRef,
@@ -634,8 +804,10 @@ export default function TerminalPane({
     updateTabPtyId,
     markWorktreeUnread,
     markTerminalTabUnread,
+    markTerminalPaneUnread,
     clearWorktreeUnread,
     clearTerminalTabUnread,
+    clearTerminalPaneUnread,
     dispatchNotification,
     setCacheTimerStartedAt,
     syncPanePtyLayoutBinding,
@@ -649,6 +821,69 @@ export default function TerminalPane({
     setRenamingPaneId,
     setPaneCount
   })
+
+  useEffect(() => {
+    if (!(globalThis as { __ORCA_WEB_CLIENT__?: boolean }).__ORCA_WEB_CLIENT__) {
+      return
+    }
+    const manager = managerRef.current
+    if (!manager || !restoredLayout.root) {
+      return
+    }
+    const insertions = planTerminalLiveLayoutInsertions(
+      restoredLayout.root,
+      manager.getPanes().map((pane) => pane.leafId)
+    )
+    if (insertions.length === 0) {
+      return
+    }
+
+    let appliedInsertion = false
+    for (const insertion of insertions) {
+      const ptyId = restoredLayout.ptyIdsByLeafId?.[insertion.newLeafId]
+      const sourcePaneId = manager.getNumericIdForLeaf(insertion.sourceLeafId)
+      if (!ptyId || sourcePaneId === null || manager.getNumericIdForLeaf(insertion.newLeafId)) {
+        continue
+      }
+      // Why: paired web terminals receive host split-pane snapshots after the
+      // pane manager is already mounted. Adopt the host leaf + PTY instead of
+      // spawning a local-only web pane.
+      // Before-placement swaps [source, new] after splitPane, so invert the
+      // host first-child ratio before applying it to the temporary order.
+      const splitRatio =
+        insertion.ratio === undefined
+          ? undefined
+          : insertion.placement === 'before'
+            ? 1 - insertion.ratio
+            : insertion.ratio
+      const createdPane = manager.splitPaneAroundLeafIds(
+        insertion.sourceLeafIds,
+        sourcePaneId,
+        insertion.direction,
+        {
+          ...(splitRatio !== undefined && { ratio: splitRatio }),
+          leafId: insertion.newLeafId,
+          ptyId,
+          placement: insertion.placement
+        }
+      )
+      if (!createdPane) {
+        continue
+      }
+      appliedInsertion = true
+    }
+
+    if (appliedInsertion) {
+      persistLayoutSnapshot()
+    }
+
+    if (restoredLayout.activeLeafId) {
+      const activePaneId = manager.getNumericIdForLeaf(restoredLayout.activeLeafId)
+      if (activePaneId !== null) {
+        manager.setActivePane(activePaneId, { focus: isActive })
+      }
+    }
+  }, [isActive, paneCount, persistLayoutSnapshot, restoredLayout])
 
   // Why (Activity-only pane isolation): when this TerminalPane is being
   // portaled into the Activity page for a specific agent pane, hide the
@@ -722,6 +957,7 @@ export default function TerminalPane({
     const snapshots = activityIsolationSnapshotRef.current
     return () => {
       restoreExpandedLayoutFrom(snapshots)
+      cancelPendingPaneSizeRefreshFrames({ pendingPaneSizeRefreshFrameIdsRef })
     }
   }, [])
 
@@ -774,8 +1010,10 @@ export default function TerminalPane({
         updateTabPtyId,
         markWorktreeUnread,
         markTerminalTabUnread,
+        markTerminalPaneUnread,
         clearWorktreeUnread,
         clearTerminalTabUnread,
+        clearTerminalPaneUnread,
         dispatchNotification,
         setCacheTimerStartedAt,
         syncPanePtyLayoutBinding
@@ -791,8 +1029,10 @@ export default function TerminalPane({
       dispatchNotification,
       markWorktreeUnread,
       markTerminalTabUnread,
+      markTerminalPaneUnread,
       clearWorktreeUnread,
       clearTerminalTabUnread,
+      clearTerminalPaneUnread,
       onPtyExitRef,
       setCacheTimerStartedAt,
       setRuntimePaneTitle,
@@ -843,9 +1083,12 @@ export default function TerminalPane({
     setSearchOpen,
     onSearchSelectedText: handleSearchSelectedText,
     onRequestClosePane: handleRequestClosePane,
+    onClearPaneScrollback: clearPaneScrollback,
     searchOpenRef,
     searchStateRef,
-    macOptionAsAltRef
+    macOptionAsAltRef,
+    keybindings,
+    terminalShortcutPolicy: settings?.terminalShortcutPolicy ?? 'orca-first'
   })
 
   useTerminalPaneGlobalEffects({
@@ -859,6 +1102,10 @@ export default function TerminalPane({
     cwd,
     isActive,
     isVisible,
+    // Why: hidden startup probes are opacity-hidden but measurable; ordinary
+    // hidden tabs are display:none and refit on visibility resume instead.
+    isSyncFitEnabled: isVisible || shouldMeasureHiddenStartup,
+    paneCount,
     managerRef,
     containerRef,
     paneTransportsRef,
@@ -867,7 +1114,51 @@ export default function TerminalPane({
     toggleExpandPane
   })
 
-  // Intercept paste at the keydown level (Cmd+V / Ctrl+V) AND as a fallback
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container) {
+      return
+    }
+    const syncFocused = (focused: boolean): void => {
+      window.api.ui.setTerminalInputFocused?.(focused)
+    }
+    const onFocusIn = (event: FocusEvent): void => {
+      if (isXtermHelperTextarea(event.target)) {
+        syncFocused(true)
+      }
+    }
+    const onFocusOut = (event: FocusEvent): void => {
+      if (!isXtermHelperTextarea(event.target)) {
+        return
+      }
+      if (isXtermHelperTextarea(event.relatedTarget)) {
+        return
+      }
+      syncFocused(false)
+    }
+
+    if (
+      isXtermHelperTextarea(document.activeElement) &&
+      container.contains(document.activeElement)
+    ) {
+      syncFocused(true)
+    }
+    container.addEventListener('focusin', onFocusIn)
+    container.addEventListener('focusout', onFocusOut)
+    return () => {
+      container.removeEventListener('focusin', onFocusIn)
+      container.removeEventListener('focusout', onFocusOut)
+      if (
+        isXtermHelperTextarea(document.activeElement) &&
+        container.contains(document.activeElement)
+      ) {
+        syncFocused(false)
+      }
+    }
+  }, [])
+
+  // Intercept paste at the keydown level (configurable terminal paste chords)
+  // AND as a fallback
   // on the paste event. We must handle keydown because Chromium does not fire
   // a paste event when the clipboard contains only image data (no text
   // representation) and the target is a textarea — which is exactly how
@@ -887,54 +1178,61 @@ export default function TerminalPane({
       return
     }
 
-    // Shared helper: try text first (fast path, single IPC call for the
-    // common case), then check for a clipboard image only when text is empty
-    // — which is the image-only clipboard scenario this fix targets.
-    const pasteFromClipboard = (pane: { terminal: { paste: (data: string) => void } }): void => {
-      void window.api.ui
-        .readClipboardText()
-        .then((text) => {
-          if (text) {
-            pane.terminal.paste(text)
-            return
-          }
-          // Why: clipboard has no text — check for an image. This is the
-          // image-only clipboard case (e.g. screenshot) where Chromium's paste
-          // event would never fire on a textarea. We save the image to a temp
-          // file owned by the terminal host and paste that path.
-          const connectionId = getConnectionId(worktreeId) ?? null
-          return window.api.ui
-            .saveClipboardImageAsTempFile({ connectionId })
-            .then((filePath) => {
-              if (filePath) {
-                pane.terminal.paste(filePath)
-              }
-            })
-            .catch((error: unknown) => {
-              setTerminalError(formatClipboardImagePasteError(error))
-            })
-        })
-        .catch(() => {
-          /* ignore clipboard failures */
-        })
+    const pasteFromClipboard = (pane: ManagedPane): void => {
+      const connectionId = getConnectionId(worktreeId) ?? null
+      void pasteTerminalClipboard({
+        readClipboardText: window.api.ui.readClipboardText,
+        saveClipboardImageAsTempFile: window.api.ui.saveClipboardImageAsTempFile,
+        connectionId,
+        pasteText: (text, options) => pasteTerminalText(pane.terminal, text, options),
+        onImagePasteError: (error) => setTerminalError(formatClipboardImagePasteError(error))
+      }).catch(() => {
+        /* ignore clipboard failures */
+      })
     }
 
-    // Why: intercept Cmd+V / Ctrl+V at the keydown level so we can check
-    // for clipboard images via Electron's main-process clipboard API. The
-    // browser's paste event is unreliable for image-only clipboards when the
-    // target is a <textarea> (xterm.js's hidden input), so this handler
-    // ensures image paste works regardless.
     const isMac = navigator.userAgent.includes('Mac')
+    const shortcutPlatform: NodeJS.Platform = isMac
+      ? 'darwin'
+      : navigator.userAgent.includes('Windows')
+        ? 'win32'
+        : 'linux'
+    let suppressNextNativePaste = false
+    let pasteSuppressionTimerId: number | null = null
+    const shouldSuppressNativePaste = (e: KeyboardEvent): boolean => {
+      const key = e.key.toLowerCase()
+      return (
+        (isMac && key === 'v' && e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) ||
+        (!isMac && key === 'v' && e.ctrlKey && !e.metaKey && !e.altKey) ||
+        (!isMac && e.key === 'Insert' && e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+      )
+    }
     const onKeyPaste = (e: KeyboardEvent): void => {
-      if (e.key.toLowerCase() !== 'v') {
-        return
-      }
-      const mod = isMac ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey
-      if (!mod || e.altKey || e.shiftKey) {
-        return
-      }
       const target = e.target
       if (target instanceof Element && target.closest('[data-terminal-search-root]')) {
+        return
+      }
+      const matchesPaste = keybindingMatchesAction(
+        'terminal.paste',
+        e,
+        shortcutPlatform,
+        keybindings,
+        { context: 'terminal' }
+      )
+      if (!matchesPaste) {
+        if (shouldSuppressNativePaste(e)) {
+          // Why: bare Ctrl+V is readline's quote-insert on Windows/Linux. If
+          // Chromium turns it into a native paste event, suppress that follow-up
+          // paste while still letting xterm receive the original keydown.
+          suppressNextNativePaste = true
+          if (pasteSuppressionTimerId !== null) {
+            window.clearTimeout(pasteSuppressionTimerId)
+          }
+          pasteSuppressionTimerId = window.setTimeout(() => {
+            pasteSuppressionTimerId = null
+            suppressNextNativePaste = false
+          }, 0)
+        }
         return
       }
       e.preventDefault()
@@ -957,6 +1255,16 @@ export default function TerminalPane({
       if (target instanceof Element && target.closest('[data-terminal-search-root]')) {
         return
       }
+      if (suppressNextNativePaste) {
+        suppressNextNativePaste = false
+        if (pasteSuppressionTimerId !== null) {
+          window.clearTimeout(pasteSuppressionTimerId)
+          pasteSuppressionTimerId = null
+        }
+        e.preventDefault()
+        e.stopPropagation()
+        return
+      }
       e.preventDefault()
       e.stopPropagation()
       const manager = managerRef.current
@@ -973,13 +1281,16 @@ export default function TerminalPane({
     container.addEventListener('keydown', onKeyPaste, { capture: true })
     container.addEventListener('paste', onPaste, { capture: true })
     return () => {
+      if (pasteSuppressionTimerId !== null) {
+        window.clearTimeout(pasteSuppressionTimerId)
+      }
       container.removeEventListener('keydown', onKeyPaste, { capture: true })
       container.removeEventListener('paste', onPaste, { capture: true })
     }
-  }, [isActive, worktreeId])
+  }, [isActive, worktreeId, keybindings])
 
   // Why: a click inside the terminal container is a deliberate interaction
-  // with the pane — dismiss the bell indicator for this tab and worktree
+  // with the pane — dismiss the attention indicator for this tab and worktree
   // (ghostty "show until interact" semantics). onData already covers
   // keystrokes; pointerdown covers the mouse path, including right-click
   // and middle-click paste, which also count as engagement with the pane.
@@ -999,15 +1310,34 @@ export default function TerminalPane({
     if (!container) {
       return
     }
-    const onPointerDown = (): void => {
+    const onPointerDown = (event: PointerEvent): void => {
       clearTerminalTabUnread(tabId)
       clearWorktreeUnread(worktreeId)
+      const paneElement =
+        event.target instanceof Element ? event.target.closest('.pane[data-leaf-id]') : null
+      const leafId = paneElement?.getAttribute('data-leaf-id')
+      if (leafId) {
+        clearTerminalPaneUnread(makePaneKey(tabId, leafId))
+      }
     }
     container.addEventListener('pointerdown', onPointerDown, { capture: true })
     return () => {
       container.removeEventListener('pointerdown', onPointerDown, { capture: true })
     }
-  }, [tabId, worktreeId, clearTerminalTabUnread, clearWorktreeUnread])
+  }, [tabId, worktreeId, clearTerminalTabUnread, clearTerminalPaneUnread, clearWorktreeUnread])
+
+  const applyTerminalPaneAttention = useCallback(() => {
+    const manager = managerRef.current
+    if (!manager) {
+      return
+    }
+    applyTerminalPaneAttentionToManager(manager, tabId)
+  }, [tabId])
+
+  useLayoutEffect(() => {
+    applyTerminalPaneAttention()
+    return subscribeTerminalPaneAttention(tabId, applyTerminalPaneAttention)
+  }, [tabId, paneCount, applyTerminalPaneAttention])
 
   // Sync the data-has-title attribute on pane containers when titles change,
   // and reflow terminals so safeFit() sees the correct available height.
@@ -1077,9 +1407,13 @@ export default function TerminalPane({
         existingLayout: existing,
         // Why: beforeunload skips local/floating bytes because session payloads
         // immediately prune them; worktree sleep keeps them as defense-in-depth.
-        captureBuffers: shouldCaptureScrollbackBuffers
+        captureBuffers: shouldCaptureScrollbackBuffers,
+        clearedScrollbackLeafIds: clearedScrollbackLeafIdsRef.current
       })
       setTabLayout(tabId, layout)
+      for (const pane of panes) {
+        clearedScrollbackLeafIdsRef.current.delete(pane.leafId)
+      }
     }
     shutdownBufferCaptures.set(tabId, captureBuffers)
     return () => {
@@ -1091,10 +1425,46 @@ export default function TerminalPane({
     }
   }, [tabId, worktreeId, setTabLayout])
 
-  const handleStartRename = useCallback((paneId: number) => {
-    setRenameValue(paneTitlesRef.current[paneId] ?? '')
-    setRenamingPaneId(paneId)
+  const cancelPendingRenameFrames = useCallback(() => {
+    const frameRefs = [renameFocusFrameRef, renameEnableBlurFrameRef, renameRefocusFrameRef]
+    for (const frameRef of frameRefs) {
+      if (frameRef.current !== null) {
+        cancelAnimationFrame(frameRef.current)
+        frameRef.current = null
+      }
+    }
   }, [])
+
+  const closeRenameSession = useCallback(() => {
+    renameSessionIdRef.current += 1
+    renameBlurCommitEnabledRef.current = true
+    cancelPendingRenameFrames()
+  }, [cancelPendingRenameFrames])
+
+  const setContainerRef = useCallback(
+    (node: HTMLDivElement | null): void => {
+      containerRef.current = node
+      if (node !== null) {
+        return
+      }
+      // Why: inline title rename focus/blur frames are owned by the terminal
+      // container; invalidate them when that DOM owner detaches.
+      closeRenameSession()
+    },
+    [closeRenameSession]
+  )
+
+  const handleStartRename = useCallback(
+    (paneId: number) => {
+      cancelPendingRenameFrames()
+      renameSessionIdRef.current += 1
+      renameBlurCommitEnabledRef.current = false
+      renameSubmittedRef.current = false
+      setRenameValue(paneTitlesRef.current[paneId] ?? '')
+      setRenamingPaneId(paneId)
+    },
+    [cancelPendingRenameFrames]
+  )
 
   const removePaneTitle = useCallback(
     (paneId: number) => {
@@ -1131,6 +1501,7 @@ export default function TerminalPane({
       if (paneTitlesRef.current[renamingPaneId]) {
         removePaneTitle(renamingPaneId)
       }
+      closeRenameSession()
       setRenamingPaneId(null)
       return
     }
@@ -1144,15 +1515,52 @@ export default function TerminalPane({
     if (leafId) {
       removedTitleLeafIdsRef.current.delete(leafId)
     }
+    closeRenameSession()
     setRenamingPaneId(null)
     // Persist immediately so the title survives restarts.
     persistLayoutSnapshot()
-  }, [renamingPaneId, renameValue, removePaneTitle, persistLayoutSnapshot])
+  }, [closeRenameSession, renamingPaneId, renameValue, removePaneTitle, persistLayoutSnapshot])
 
   const handleRenameCancel = useCallback(() => {
     renameSubmittedRef.current = true
+    closeRenameSession()
     setRenamingPaneId(null)
-  }, [])
+  }, [closeRenameSession])
+
+  const handleRenameBlur = useCallback(() => {
+    if (renameBlurCommitEnabledRef.current) {
+      handleRenameSubmit()
+      return
+    }
+    if (renamingPaneId === null || renameRefocusFrameRef.current !== null) {
+      return
+    }
+
+    const sessionId = renameSessionIdRef.current
+    const paneId = renamingPaneId
+    // Why: the context-menu selection can be followed by a delayed Radix/xterm
+    // focus handoff. That synthetic early blur is not a title submission.
+    renameRefocusFrameRef.current = requestAnimationFrame(() => {
+      renameRefocusFrameRef.current = null
+      if (renameSessionIdRef.current !== sessionId || renamingPaneId !== paneId) {
+        return
+      }
+      const input = renameInputRef.current
+      if (!input) {
+        renameBlurCommitEnabledRef.current = true
+        handleRenameSubmit()
+        return
+      }
+      input.focus()
+      input.select()
+      if (document.activeElement === input) {
+        renameBlurCommitEnabledRef.current = true
+        return
+      }
+      renameBlurCommitEnabledRef.current = true
+      handleRenameSubmit()
+    })
+  }, [handleRenameSubmit, renamingPaneId])
 
   const handleRemoveTitle = useCallback(
     (paneId: number) => removePaneTitle(paneId),
@@ -1165,24 +1573,49 @@ export default function TerminalPane({
     if (renamingPaneId === null) {
       return
     }
+    const sessionId = renameSessionIdRef.current
+    const paneId = renamingPaneId
     renameSubmittedRef.current = false
-    const frame = requestAnimationFrame(() => {
-      renameInputRef.current?.focus()
-      renameInputRef.current?.select()
+    renameFocusFrameRef.current = requestAnimationFrame(() => {
+      renameFocusFrameRef.current = null
+      if (renameSessionIdRef.current !== sessionId || renamingPaneId !== paneId) {
+        return
+      }
+      const input = renameInputRef.current
+      if (!input) {
+        return
+      }
+      input.focus()
+      input.select()
+      renameEnableBlurFrameRef.current = requestAnimationFrame(() => {
+        renameEnableBlurFrameRef.current = null
+        if (
+          renameSessionIdRef.current === sessionId &&
+          renamingPaneId === paneId &&
+          renameInputRef.current === input &&
+          document.activeElement === input
+        ) {
+          renameBlurCommitEnabledRef.current = true
+        }
+      })
     })
-    return () => cancelAnimationFrame(frame)
-  }, [renamingPaneId])
+    return () => cancelPendingRenameFrames()
+  }, [cancelPendingRenameFrames, renamingPaneId])
 
   const contextMenu = useTerminalPaneContextMenu({
+    tabId,
     managerRef,
     paneTransportsRef,
     paneCwdRef,
     worktreeId,
+    groupId: quickCommandGroupId,
     fallbackCwd: cwd ?? '',
     toggleExpandPane,
     onRequestClosePane: handleRequestClosePane,
+    onClearPaneScrollback: clearPaneScrollback,
     onSetTitle: handleStartRename,
     onPasteError: setTerminalError,
+    onAgentSessionForkReady: setAgentSessionFork,
     rightClickToPaste
   })
 
@@ -1237,7 +1670,7 @@ export default function TerminalPane({
       clickedPane.terminal.focus()
       void readPrimarySelectionText().then((text) => {
         if (text) {
-          clickedPane.terminal.paste(text)
+          pasteTerminalText(clickedPane.terminal, text)
         }
       })
     },
@@ -1275,7 +1708,11 @@ export default function TerminalPane({
     // Why: split groups can keep one terminal visible in an unfocused group so
     // users still see its output while typing elsewhere. Hiding on `isActive`
     // blanked the previously focused pane and exposed the white group body.
-    display: isVisible ? 'flex' : 'none',
+    display: isVisible || shouldMeasureHiddenStartup ? 'flex' : 'none',
+    // Why: split divider lines intentionally overdraw inside the pane tree.
+    // `hidden` reliably clips that pseudo-element paint at the terminal body.
+    overflow: 'hidden',
+    ...(shouldMeasureHiddenStartup ? { opacity: 0, pointerEvents: 'none' } : {}),
     ['--orca-terminal-divider-color' as string]:
       effectiveAppearance?.dividerColor ?? DEFAULT_TERMINAL_DIVIDER_DARK,
     ['--orca-terminal-divider-color-strong' as string]: normalizeColor(
@@ -1288,9 +1725,10 @@ export default function TerminalPane({
   return (
     <>
       <div
-        ref={containerRef}
+        ref={setContainerRef}
         className="absolute inset-0 min-h-0 min-w-0"
         data-native-file-drop-target="terminal"
+        data-contextual-tour-target="terminal-pane-split-target"
         data-terminal-tab-id={tabId}
         data-pane-title-surface={titleUsesLightSurface ? 'light' : 'dark'}
         style={terminalContainerStyle}
@@ -1346,8 +1784,13 @@ export default function TerminalPane({
         }}
       />
       {terminalError && isActive && (
-        <TerminalErrorToast error={terminalError} onDismiss={() => setTerminalError(null)} />
+        <TerminalErrorToast
+          error={terminalError}
+          onDismiss={() => setTerminalError(null)}
+          onRestartDaemon={() => daemonActions.setPending('restart')}
+        />
       )}
+      <DaemonActionDialog api={daemonActions} />
       {isActive && (
         <TerminalSessionStateSaveFailureDialog
           open={sessionStateSaveFailureOpen}
@@ -1380,15 +1823,40 @@ export default function TerminalPane({
         onPaste={() => void contextMenu.onPaste()}
         onSplitRight={contextMenu.onSplitRight}
         onSplitDown={contextMenu.onSplitDown}
+        keybindings={keybindings}
         onEqualizePaneSizes={contextMenu.onEqualizePaneSizes}
         onClosePane={contextMenu.onClosePane}
         onClearScreen={contextMenu.onClearScreen}
-        quickCommands={(settings?.terminalQuickCommands ?? []).filter(
-          (command) => command.label.trim() && command.command.trimEnd()
-        )}
+        onForkAgentSession={() => void contextMenu.onForkAgentSession()}
+        repoQuickCommands={repoQuickCommands}
+        globalQuickCommands={globalQuickCommands}
+        quickCommandRepoLabel={quickCommandRepoLabel}
         onQuickCommand={contextMenu.onQuickCommand}
+        onAddQuickCommand={
+          quickCommandRepoId
+            ? () => openQuickCommandEditor({ type: 'repo', repoId: quickCommandRepoId })
+            : () => openQuickCommandEditor({ type: 'global' })
+        }
         onToggleExpand={contextMenu.onToggleExpand}
         onSetTitle={contextMenu.onSetTitle}
+        onCopyPaneId={contextMenu.onCopyPaneId}
+      />
+      {/* Why: repos is a broad store slice; only subscribe while the editor is visible. */}
+      {quickCommandEditorOpen ? (
+        <TerminalQuickCommandEditorDialog
+          command={quickCommandDraft}
+          onOpenChange={setQuickCommandEditorOpen}
+          onSave={saveQuickCommand}
+        />
+      ) : null}
+      <TerminalAgentSessionForkDialog
+        open={agentSessionFork !== null}
+        fork={agentSessionFork}
+        onOpenChange={(open) => {
+          if (!open) {
+            setAgentSessionFork(null)
+          }
+        }}
       />
       {/* Title bar overlays — portaled into each pane container that has a title
           or is currently being renamed (so the inline input appears even for
@@ -1424,7 +1892,7 @@ export default function TerminalPane({
                     handleRenameCancel()
                   }
                 }}
-                onBlur={handleRenameSubmit}
+                onBlur={handleRenameBlur}
               />
             ) : (
               <>

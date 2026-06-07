@@ -1,13 +1,17 @@
 /* eslint-disable max-lines -- Why: shared type definitions for all runtime RPC methods live in one file for discoverability and import simplicity. */
-import type { AgentStatusEntry } from './agent-status-types'
+import type { AgentStatusEntry, AgentStatusOrchestrationContext } from './agent-status-types'
 import type {
   BaseRefSearchResult,
   BrowserCookieImportResult,
   BrowserSessionProfile,
   BrowserSessionProfileSource,
   GitWorktreeInfo,
+  RemoveWorktreeResult,
   Repo,
+  TabGroupLayoutNode,
+  TerminalColorOverrides,
   TerminalLayoutSnapshot,
+  TuiAgent,
   Worktree,
   WorktreeLineage,
   WorktreeLineageWarning
@@ -44,6 +48,7 @@ export type RuntimeStatus = {
   runtimeProtocolVersion?: number
   minCompatibleRuntimeClientVersion?: number
   capabilities?: RuntimeCapability[]
+  hostPlatform?: NodeJS.Platform
   // COMPAT(runtimeStatusMobileAliases): added 2026-05-15 for mobile builds
   // that still read these names; new desktop/CLI code uses the fields above.
   protocolVersion?: number
@@ -96,6 +101,12 @@ export type RuntimeSyncWindowGraph = {
   mobileSessionTabs?: RuntimeMobileSessionTabsSnapshot[]
 }
 
+export type RuntimeSyncWindowGraphResult = RuntimeStatus & {
+  /** Main owns terminal handles/dispatches, so renderer graph sync returns the
+   *  parent metadata needed by title-derived agent rows without name guessing. */
+  agentOrchestrationByPaneKey?: Record<string, AgentStatusOrchestrationContext>
+}
+
 export type RuntimeMobileSessionTerminalTab = {
   type: 'terminal'
   id: string
@@ -103,9 +114,16 @@ export type RuntimeMobileSessionTerminalTab = {
   parentTabId: string
   leafId: string
   ptyId?: string | null
+  terminalTheme?: RuntimeMobileTerminalTheme
   agentStatus?: AgentStatusEntry | null
+  launchAgent?: TuiAgent
   parentLayout?: TerminalLayoutSnapshot
   isActive: boolean
+}
+
+export type RuntimeMobileTerminalTheme = {
+  mode: 'dark' | 'light'
+  theme: TerminalColorOverrides
 }
 
 export type RuntimeMobileSessionMarkdownTab = {
@@ -172,6 +190,36 @@ export type RuntimeMobileSessionClientTab =
   | RuntimeMobileSessionFileTab
   | RuntimeMobileSessionBrowserTab
 
+export type RuntimeMobileSessionTabGroup = {
+  id: string
+  activeTabId: string | null
+  tabOrder: string[]
+  recentTabIds?: string[]
+}
+
+type RuntimeMobileSessionTabMoveBase = {
+  tabId: string
+  targetGroupId: string
+}
+
+export type RuntimeMobileSessionTabMove =
+  | (RuntimeMobileSessionTabMoveBase & {
+      kind: 'reorder'
+      tabOrder: string[]
+    })
+  | (RuntimeMobileSessionTabMoveBase & {
+      kind: 'move-to-group'
+      index?: number
+    })
+  | (RuntimeMobileSessionTabMoveBase & {
+      kind: 'split'
+      splitDirection: 'left' | 'right' | 'up' | 'down'
+    })
+
+export type RuntimeMobileSessionTabMoveResult = {
+  moved: true
+}
+
 export type RuntimeMobileSessionTabsSnapshot = {
   worktree: string
   publicationEpoch: string
@@ -179,6 +227,8 @@ export type RuntimeMobileSessionTabsSnapshot = {
   activeGroupId: string | null
   activeTabId: string | null
   activeTabType: 'terminal' | 'markdown' | 'file' | 'browser' | null
+  tabGroups?: RuntimeMobileSessionTabGroup[]
+  tabGroupLayout?: TabGroupLayoutNode | null
   tabs: RuntimeMobileSessionSnapshotTab[]
 }
 
@@ -189,6 +239,8 @@ export type RuntimeMobileSessionTabsResult = {
   activeGroupId: string | null
   activeTabId: string | null
   activeTabType: 'terminal' | 'markdown' | 'file' | 'browser' | null
+  tabGroups?: RuntimeMobileSessionTabGroup[]
+  tabGroupLayout?: TabGroupLayoutNode | null
   tabs: RuntimeMobileSessionClientTab[]
 }
 
@@ -275,7 +327,11 @@ export type RuntimeTerminalRead = {
   status: RuntimeTerminalState
   tail: string[]
   truncated: boolean
+  limited?: boolean
+  oldestCursor?: string
   nextCursor: string | null
+  latestCursor?: string
+  returnedLineCount?: number
 }
 
 export type RuntimeTerminalRename = {
@@ -316,6 +372,13 @@ export type RuntimeTerminalClose = {
 }
 
 export type RuntimeTerminalWaitCondition = 'exit' | 'tui-idle'
+export type RuntimeTerminalWaitBlockedReason =
+  | 'codex-update-prompt'
+  | 'codex-trust-workspace'
+  | 'codex-cwd-prompt'
+  | 'codex-model-migration-prompt'
+  | 'codex-hooks-review-prompt'
+  | 'codex-interactive-prompt'
 
 export type RuntimeTerminalWait = {
   handle: string
@@ -323,6 +386,7 @@ export type RuntimeTerminalWait = {
   satisfied: boolean
   status: RuntimeTerminalState
   exitCode: number | null
+  blockedReason?: RuntimeTerminalWaitBlockedReason
 }
 
 export type RuntimeWorktreePsSummary = {
@@ -358,6 +422,11 @@ export type RuntimeWorktreeCreateResult = {
   worktree: RuntimeWorktreeRecord
   lineage: WorktreeLineage | null
   warnings: WorktreeLineageWarning[]
+  warning?: string
+}
+
+export type RuntimeWorktreeRemoveResult = RemoveWorktreeResult & {
+  removed: boolean
   warning?: string
 }
 

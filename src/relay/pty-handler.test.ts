@@ -3,6 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
+import { DEFAULT_SSH_RELAY_GRACE_PERIOD_SECONDS } from '../shared/ssh-types'
 
 const { mockPtySpawn, mockPtyInstance } = vi.hoisted(() => ({
   mockPtySpawn: vi.fn(),
@@ -122,6 +123,41 @@ describe('PtyHandler', () => {
     expect(notifMethods).toContain('pty.ackData')
   })
 
+  it('allows callers to shorten a grace timer for empty startup relays', () => {
+    const onExpire = vi.fn()
+    handler.startGraceTimer(onExpire, 100)
+
+    expect(handler.graceTimerActive).toBe(true)
+    vi.advanceTimersByTime(99)
+    expect(onExpire).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    expect(onExpire).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not expire an unlimited grace timer', () => {
+    const onExpire = vi.fn()
+    handler.startGraceTimer(onExpire, 100)
+
+    expect(handler.graceTimerActive).toBe(true)
+    handler.startGraceTimer(onExpire, 0)
+
+    expect(handler.graceTimerActive).toBe(false)
+    vi.advanceTimersByTime(100)
+    expect(onExpire).not.toHaveBeenCalled()
+  })
+
+  it('uses the configured grace time for future disconnect timers', () => {
+    const onExpire = vi.fn()
+
+    handler.setGraceTimeMs(250)
+    handler.startGraceTimer(onExpire)
+
+    vi.advanceTimersByTime(249)
+    expect(onExpire).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
+    expect(onExpire).toHaveBeenCalledTimes(1)
+  })
+
   it('spawns a PTY and returns an id', async () => {
     const result = await dispatcher.callRequest('pty.spawn', { cols: 80, rows: 24 })
     expect(result).toEqual({ id: 'pty-1' })
@@ -176,7 +212,84 @@ describe('PtyHandler', () => {
     expect(dataCallback).toBeDefined()
 
     dataCallback!('hello world')
+    expect(dispatcher.notify).not.toHaveBeenCalledWith('pty.data', expect.anything())
+    vi.advanceTimersByTime(8)
     expect(dispatcher.notify).toHaveBeenCalledWith('pty.data', { id: 'pty-1', data: 'hello world' })
+  })
+
+  it('coalesces background PTY output before notifying the client', async () => {
+    let dataCallback: ((data: string) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn((cb: (data: string) => void) => {
+        dataCallback = cb
+      }),
+      onExit: vi.fn()
+    })
+
+    await dispatcher.callRequest('pty.spawn', {})
+    dataCallback!('hello ')
+    dataCallback!('world')
+
+    expect(dispatcher.notify).not.toHaveBeenCalledWith('pty.data', expect.anything())
+    vi.advanceTimersByTime(8)
+    expect(dispatcher.notify).toHaveBeenCalledWith('pty.data', {
+      id: 'pty-1',
+      data: 'hello world'
+    })
+  })
+
+  it('sends recent-input redraw output immediately', async () => {
+    let dataCallback: ((data: string) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn((cb: (data: string) => void) => {
+        dataCallback = cb
+      }),
+      onExit: vi.fn()
+    })
+
+    await dispatcher.callRequest('pty.spawn', {})
+    dispatcher.callNotification('pty.data', { id: 'pty-1', data: 'a' })
+    dispatcher.notify.mockClear()
+
+    dataCallback!('\x1b[20;2Hredraw')
+
+    expect(dispatcher.notify).toHaveBeenCalledWith('pty.data', {
+      id: 'pty-1',
+      data: '\x1b[20;2Hredraw'
+    })
+    vi.advanceTimersByTime(8)
+    expect(dispatcher.notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('drains large relay PTY output in bounded slices', async () => {
+    let dataCallback: ((data: string) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn((cb: (data: string) => void) => {
+        dataCallback = cb
+      }),
+      onExit: vi.fn()
+    })
+
+    await dispatcher.callRequest('pty.spawn', {})
+    const firstChunk = 'x'.repeat(16 * 1024)
+    dataCallback!(`${firstChunk}tail`)
+
+    vi.advanceTimersByTime(8)
+    expect(dispatcher.notify).toHaveBeenCalledTimes(1)
+    expect(dispatcher.notify).toHaveBeenNthCalledWith(1, 'pty.data', {
+      id: 'pty-1',
+      data: firstChunk
+    })
+
+    vi.advanceTimersByTime(1)
+    expect(dispatcher.notify).toHaveBeenCalledTimes(2)
+    expect(dispatcher.notify).toHaveBeenNthCalledWith(2, 'pty.data', {
+      id: 'pty-1',
+      data: 'tail'
+    })
   })
 
   it('returns attach replay instead of notifying when replay notification is suppressed', async () => {
@@ -199,6 +312,8 @@ describe('PtyHandler', () => {
 
     expect(result).toEqual({ replay: 'buffered output' })
     expect(dispatcher.notify).not.toHaveBeenCalledWith('pty.replay', expect.anything())
+    vi.advanceTimersByTime(8)
+    expect(dispatcher.notify).not.toHaveBeenCalledWith('pty.data', expect.anything())
   })
 
   it('notifies replay on normal attach', async () => {
@@ -222,6 +337,8 @@ describe('PtyHandler', () => {
       id: 'pty-1',
       data: 'buffered output'
     })
+    vi.advanceTimersByTime(8)
+    expect(dispatcher.notify).not.toHaveBeenCalledWith('pty.data', expect.anything())
   })
 
   it('notifies on PTY exit and removes from map', async () => {
@@ -240,6 +357,30 @@ describe('PtyHandler', () => {
     exitCallback!({ exitCode: 0 })
     expect(dispatcher.notify).toHaveBeenCalledWith('pty.exit', { id: 'pty-1', code: 0 })
     expect(handler.activePtyCount).toBe(0)
+  })
+
+  it('flushes pending PTY output before notifying exit', async () => {
+    let dataCallback: ((data: string) => void) | undefined
+    let exitCallback: ((info: { exitCode: number }) => void) | undefined
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      onData: vi.fn((cb: (data: string) => void) => {
+        dataCallback = cb
+      }),
+      onExit: vi.fn((cb: (info: { exitCode: number }) => void) => {
+        exitCallback = cb
+      })
+    })
+
+    await dispatcher.callRequest('pty.spawn', {})
+    dataCallback!('final output')
+    exitCallback!({ exitCode: 0 })
+
+    expect(dispatcher.notify).toHaveBeenNthCalledWith(1, 'pty.data', {
+      id: 'pty-1',
+      data: 'final output'
+    })
+    expect(dispatcher.notify).toHaveBeenNthCalledWith(2, 'pty.exit', { id: 'pty-1', code: 0 })
   })
 
   it('writes data to PTY via pty.data notification', async () => {
@@ -282,6 +423,29 @@ describe('PtyHandler', () => {
     await dispatcher.callRequest('pty.spawn', {})
     await dispatcher.callRequest('pty.shutdown', { id: 'pty-1', immediate: false })
     expect(mockKill).toHaveBeenCalledWith('SIGTERM')
+  })
+
+  it('flushes pending PTY output before immediate shutdown cleanup', async () => {
+    let dataCallback: ((data: string) => void) | undefined
+    const mockKill = vi.fn()
+    mockPtySpawn.mockReturnValue({
+      ...mockPtyInstance,
+      kill: mockKill,
+      onData: vi.fn((cb: (data: string) => void) => {
+        dataCallback = cb
+      }),
+      onExit: vi.fn()
+    })
+
+    await dispatcher.callRequest('pty.spawn', {})
+    dataCallback!('last words')
+    await dispatcher.callRequest('pty.shutdown', { id: 'pty-1', immediate: true })
+
+    expect(dispatcher.notify).toHaveBeenNthCalledWith(1, 'pty.data', {
+      id: 'pty-1',
+      data: 'last words'
+    })
+    expect(mockKill).toHaveBeenCalledWith('SIGKILL')
   })
 
   it('notifies pty.exit when graceful shutdown falls back to SIGKILL', async () => {
@@ -332,9 +496,12 @@ describe('PtyHandler', () => {
 
   it('grace timer waits full period even when no PTYs exist', () => {
     const onExpire = vi.fn()
+    const defaultGraceMs = DEFAULT_SSH_RELAY_GRACE_PERIOD_SECONDS * 1000
     handler.startGraceTimer(onExpire)
     expect(onExpire).not.toHaveBeenCalled()
-    vi.advanceTimersByTime(5 * 60 * 1000)
+    vi.advanceTimersByTime(defaultGraceMs - 1)
+    expect(onExpire).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
     expect(onExpire).toHaveBeenCalledTimes(1)
   })
 
@@ -347,10 +514,13 @@ describe('PtyHandler', () => {
     await dispatcher.callRequest('pty.spawn', {})
 
     const onExpire = vi.fn()
+    const defaultGraceMs = DEFAULT_SSH_RELAY_GRACE_PERIOD_SECONDS * 1000
     handler.startGraceTimer(onExpire)
     expect(onExpire).not.toHaveBeenCalled()
 
-    vi.advanceTimersByTime(5 * 60 * 1000)
+    vi.advanceTimersByTime(defaultGraceMs - 1)
+    expect(onExpire).not.toHaveBeenCalled()
+    vi.advanceTimersByTime(1)
     expect(onExpire).toHaveBeenCalledTimes(1)
   })
 
@@ -363,12 +533,13 @@ describe('PtyHandler', () => {
     await dispatcher.callRequest('pty.spawn', {})
 
     const onExpire = vi.fn()
+    const defaultGraceMs = DEFAULT_SSH_RELAY_GRACE_PERIOD_SECONDS * 1000
     handler.startGraceTimer(onExpire)
 
     vi.advanceTimersByTime(60_000)
     handler.cancelGraceTimer()
 
-    vi.advanceTimersByTime(5 * 60 * 1000)
+    vi.advanceTimersByTime(defaultGraceMs)
     expect(onExpire).not.toHaveBeenCalled()
   })
 

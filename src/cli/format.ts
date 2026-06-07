@@ -33,7 +33,11 @@ import type {
   RuntimeWorktreePsResult,
   RuntimeWorktreeRecord
 } from '../shared/runtime-types'
+import type { Automation, AutomationRun } from '../shared/automations-types'
+import { formatAutomationPrecheckTimeout } from '../shared/automation-precheck'
+import { formatAutomationSchedule } from '../shared/automation-schedules'
 import type { PublicKnownRuntimeEnvironment } from '../shared/runtime-environments'
+import type { MemorySnapshot, WorktreeMemory } from '../shared/types'
 import type { RuntimeRpcFailure, RuntimeRpcSuccess } from './runtime-client'
 import { RuntimeClientError, RuntimeRpcFailureError } from './runtime-client'
 
@@ -113,6 +117,69 @@ export function formatStatus(status: CliStatusResult): string {
   return formatCliStatus(status)
 }
 
+export function formatMemorySnapshot(snapshot: MemorySnapshot): string {
+  const topWorktrees = [...snapshot.worktrees].sort((a, b) => b.memory - a.memory).slice(0, 10)
+  const lines = [
+    `collectedAt: ${new Date(snapshot.collectedAt).toISOString()}`,
+    `totalMemory: ${formatByteCount(snapshot.totalMemory)}`,
+    `totalCpu: ${formatCpu(snapshot.totalCpu)}`,
+    [
+      `hostUsed: ${formatByteCount(snapshot.host.usedMemory)}`,
+      `/ ${formatByteCount(snapshot.host.totalMemory)}`,
+      `(${snapshot.host.memoryUsagePercent.toFixed(1)}%)`
+    ].join(' '),
+    [
+      `app: ${formatByteCount(snapshot.app.memory)}`,
+      `(main ${formatByteCount(snapshot.app.main.memory)},`,
+      `renderer ${formatByteCount(snapshot.app.renderer.memory)},`,
+      `other ${formatByteCount(snapshot.app.other.memory)})`
+    ].join(' '),
+    `worktrees: ${snapshot.worktrees.length}`
+  ]
+
+  if (topWorktrees.length === 0) {
+    lines.push('topWorktrees: none')
+    return lines.join('\n')
+  }
+
+  lines.push('', 'Top worktrees:')
+  for (const worktree of topWorktrees) {
+    lines.push(formatWorktreeMemoryLine(worktree))
+  }
+  if (snapshot.worktrees.length > topWorktrees.length) {
+    lines.push(`... ${snapshot.worktrees.length - topWorktrees.length} more worktrees`)
+  }
+  return lines.join('\n')
+}
+
+function formatWorktreeMemoryLine(worktree: WorktreeMemory): string {
+  return [
+    `- ${worktree.worktreeName}`,
+    `${formatByteCount(worktree.memory)}`,
+    `${formatCpu(worktree.cpu)}`,
+    `${worktree.sessions.length} session${worktree.sessions.length === 1 ? '' : 's'}`
+  ].join('  ')
+}
+
+function formatCpu(cpu: number): string {
+  return `${cpu.toFixed(1)}%`
+}
+
+function formatByteCount(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '0 B'
+  }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unitIndex = 0
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024
+    unitIndex += 1
+  }
+  const formatted = value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)
+  return `${formatted} ${units[unitIndex]}`
+}
+
 export function formatEnvironmentList(result: {
   environments: PublicKnownRuntimeEnvironment[]
 }): string {
@@ -172,12 +239,43 @@ export function formatTerminalShow(result: { terminal: RuntimeTerminalShow }): s
 
 export function formatTerminalRead(result: { terminal: RuntimeTerminalRead }): string {
   const terminal = result.terminal
+  const oldestCursor =
+    typeof terminal.oldestCursor === 'string' ? [`oldest cursor: ${terminal.oldestCursor}`] : []
+  const latestCursor =
+    typeof terminal.latestCursor === 'string' ? [`latest cursor: ${terminal.latestCursor}`] : []
+  const limitedWarning = formatTerminalReadLimitedWarning(terminal)
   const header = [
     `handle: ${terminal.handle}`,
     `status: ${terminal.status}`,
-    ...(terminal.nextCursor !== null ? [`cursor: ${terminal.nextCursor}`] : [])
+    ...(terminal.nextCursor !== null ? [`cursor: ${terminal.nextCursor}`] : []),
+    ...oldestCursor,
+    ...latestCursor,
+    ...(terminal.truncated ? ['warning: older output is no longer retained'] : []),
+    ...(limitedWarning ? [limitedWarning] : [])
   ]
   return [...header, '', ...terminal.tail].join('\n')
+}
+
+function formatTerminalReadLimitedWarning(terminal: RuntimeTerminalRead): string | null {
+  if (!terminal.limited) {
+    return null
+  }
+  if (
+    typeof terminal.nextCursor === 'string' &&
+    typeof terminal.latestCursor === 'string' &&
+    terminal.nextCursor !== terminal.latestCursor
+  ) {
+    return `warning: output limited; continue with --cursor ${terminal.nextCursor}`
+  }
+  if (
+    typeof terminal.oldestCursor === 'string' &&
+    typeof terminal.latestCursor === 'string' &&
+    terminal.oldestCursor !== terminal.latestCursor
+  ) {
+    // A tail preview's next cursor is already latest, so oldestCursor is the retained history entry point.
+    return `warning: output limited; page retained output with --cursor ${terminal.oldestCursor} --limit <count>`
+  }
+  return 'warning: output limited'
 }
 
 export function formatTerminalSend(result: { send: RuntimeTerminalSend }): string {
@@ -210,13 +308,17 @@ export function formatTerminalClose(result: { close: RuntimeTerminalClose }): st
 }
 
 export function formatTerminalWait(result: { wait: RuntimeTerminalWait }): string {
-  return [
+  const lines = [
     `handle: ${result.wait.handle}`,
     `condition: ${result.wait.condition}`,
     `satisfied: ${result.wait.satisfied}`,
     `status: ${result.wait.status}`,
     `exitCode: ${result.wait.exitCode ?? 'null'}`
-  ].join('\n')
+  ]
+  if (result.wait.blockedReason) {
+    lines.push(`blockedReason: ${result.wait.blockedReason}`)
+  }
+  return lines.join('\n')
 }
 
 export function formatWorktreePs(result: RuntimeWorktreePsResult): string {
@@ -280,6 +382,91 @@ export function formatWorktreeShow(result: { worktree: RuntimeWorktreeRecord }):
         `${key}: ${typeof value === 'object' ? JSON.stringify(value) : String(value)}`
     )
     .join('\n')
+}
+
+export function formatAutomationList(result: { automations: Automation[] }): string {
+  if (result.automations.length === 0) {
+    return 'No automations found.'
+  }
+  return result.automations
+    .map((automation) => {
+      const status = automation.enabled ? 'enabled' : 'disabled'
+      return `${automation.id}  ${automation.name}  ${automation.agentId}  ${status}\n${formatAutomationSchedule(automation.rrule)}  next: ${new Date(automation.nextRunAt).toISOString()}`
+    })
+    .join('\n\n')
+}
+
+export function formatAutomationShow(result: { automation: Automation }): string {
+  const automation = result.automation
+  return [
+    `id: ${automation.id}`,
+    `name: ${automation.name}`,
+    `provider: ${automation.agentId}`,
+    `enabled: ${automation.enabled}`,
+    `schedule: ${formatAutomationSchedule(automation.rrule)}`,
+    `rrule: ${automation.rrule}`,
+    `precheck: ${
+      automation.precheck
+        ? `${automation.precheck.command} (timeout ${formatAutomationPrecheckTimeout(
+            automation.precheck.timeoutSeconds
+          )})`
+        : 'none'
+    }`,
+    `nextRunAt: ${new Date(automation.nextRunAt).toISOString()}`,
+    `projectId: ${automation.projectId}`,
+    `workspaceMode: ${automation.workspaceMode}`,
+    `workspaceId: ${automation.workspaceId ?? 'null'}`,
+    `baseBranch: ${automation.baseBranch ?? 'null'}`,
+    `reuseSession: ${automation.reuseSession}`,
+    `target: ${automation.executionTargetType}:${automation.executionTargetId}`,
+    `prompt: ${automation.prompt}`
+  ].join('\n')
+}
+
+export function formatAutomationRemoved(result: { removed: boolean; id: string }): string {
+  return result.removed
+    ? `Removed automation ${result.id}.`
+    : `Automation ${result.id} not removed.`
+}
+
+export function formatAutomationRun(result: { run: AutomationRun }): string {
+  return [
+    `id: ${result.run.id}`,
+    `automationId: ${result.run.automationId}`,
+    `title: ${result.run.title}`,
+    `status: ${result.run.status}`,
+    `trigger: ${result.run.trigger}`,
+    `scheduledFor: ${new Date(result.run.scheduledFor).toISOString()}`,
+    `workspaceId: ${result.run.workspaceId ?? 'null'}`,
+    `precheck: ${formatAutomationRunPrecheck(result.run)}`,
+    `error: ${result.run.error ?? 'null'}`
+  ].join('\n')
+}
+
+function formatAutomationRunPrecheck(run: AutomationRun): string {
+  const result = run.precheckResult
+  if (!result) {
+    return 'none'
+  }
+  const outcome = result.timedOut
+    ? 'timed out'
+    : result.error
+      ? 'error'
+      : `exit ${result.exitCode ?? 'unknown'}`
+  const output = result.stderr.trim() || result.stdout.trim()
+  return output ? `${outcome}; ${output}` : outcome
+}
+
+export function formatAutomationRuns(result: { runs: AutomationRun[] }): string {
+  if (result.runs.length === 0) {
+    return 'No automation runs found.'
+  }
+  return result.runs
+    .map(
+      (run) =>
+        `${run.id}  ${run.automationId}  ${run.status}  ${run.trigger}  ${new Date(run.scheduledFor).toISOString()}\n${run.title}${run.precheckResult ? `\nprecheck: ${formatAutomationRunPrecheck(run)}` : ''}${run.error ? `\nerror: ${run.error}` : ''}`
+    )
+    .join('\n\n')
 }
 
 export function formatSnapshot(result: BrowserSnapshotResult): string {
@@ -411,9 +598,12 @@ function prepareCliJsonResult<TResult>(
 }
 
 const COMPUTER_SCREENSHOT_TTL_MS = 24 * 60 * 60 * 1000
+const COMPUTER_SCREENSHOT_CLEANUP_INTERVAL_MS = 60 * 60 * 1000
+const COMPUTER_SCREENSHOT_CLEANUP_MARKER = '.last-cleanup'
 
 function computerScreenshotTempDir(): string {
-  const outputDir = join(tmpdir(), 'orca-computer-use')
+  const outputDir =
+    process.env.ORCA_COMPUTER_SCREENSHOT_TMPDIR || join(tmpdir(), 'orca-computer-use')
   mkdirSync(outputDir, { recursive: true, mode: 0o700 })
   const stat = lstatSync(outputDir)
   if (!stat.isDirectory() || stat.isSymbolicLink()) {
@@ -427,7 +617,19 @@ function computerScreenshotTempDir(): string {
 }
 
 function cleanupComputerScreenshots(outputDir: string): void {
-  const cutoff = Date.now() - COMPUTER_SCREENSHOT_TTL_MS
+  const now = Date.now()
+  const markerPath = join(outputDir, COMPUTER_SCREENSHOT_CLEANUP_MARKER)
+  try {
+    // Why: agents can call computer-use CLI commands in loops; a marker keeps
+    // temp cleanup from becoming a synchronous directory scan per screenshot.
+    if (statSync(markerPath).mtimeMs > now - COMPUTER_SCREENSHOT_CLEANUP_INTERVAL_MS) {
+      return
+    }
+  } catch {
+    // Missing or unreadable marker means this process should attempt cleanup.
+  }
+
+  const cutoff = now - COMPUTER_SCREENSHOT_TTL_MS
   for (const entry of readdirSync(outputDir)) {
     if (!entry.endsWith('-screenshot.png') && !entry.endsWith('-screenshot.img')) {
       continue
@@ -440,6 +642,11 @@ function cleanupComputerScreenshots(outputDir: string): void {
     } catch {
       // Best-effort cleanup only; formatting should not fail because a temp file raced.
     }
+  }
+  try {
+    writeFileSync(markerPath, `${now}\n`, { mode: 0o600 })
+  } catch {
+    // Best-effort marker only; stale cleanup state should not hide a screenshot.
   }
 }
 
@@ -484,15 +691,55 @@ export function formatListWindows(result: ComputerListWindowsResult): string {
     .join('\n')
 }
 
-export function formatComputerAction(verb: string, result: ComputerActionResult): string {
+export type ComputerActionFollowUpTarget = {
+  session?: string
+  worktree?: string
+  windowId?: number
+  windowIndex?: number
+  restoreWindow?: boolean
+}
+
+export function formatComputerAction(
+  verb: string,
+  result: ComputerActionResult,
+  target: ComputerActionFollowUpTarget = {}
+): string {
   const path = result.action?.path ? ` via ${result.action.path}` : ''
   const verification = formatActionVerification(result.action?.verification)
-  const app = shellQuote(result.snapshot.app.bundleId ?? result.snapshot.app.name)
-  const windowId =
-    result.snapshot.window.id === null || result.snapshot.window.id === undefined
-      ? ''
-      : ` --window-id ${result.snapshot.window.id}`
-  return `${formatActionVerb(verb)} completed${path}${verification}; ${result.snapshot.elementCount} elements in current window. Use \`orca computer get-app-state --app ${app}${windowId}\` to inspect.`
+  const followUpCommand = formatComputerFollowUpCommand(result, target)
+  return `${formatActionVerb(verb)} completed${path}${verification}; ${result.snapshot.elementCount} elements in current window. Use \`${followUpCommand}\` to inspect.`
+}
+
+function formatComputerFollowUpCommand(
+  result: ComputerActionResult,
+  target: ComputerActionFollowUpTarget
+): string {
+  const args = [
+    'orca',
+    'computer',
+    'get-app-state',
+    '--app',
+    shellQuote(result.snapshot.app.bundleId ?? result.snapshot.app.name)
+  ]
+  if (target.session) {
+    args.push('--session', shellQuote(target.session))
+  } else if (target.worktree) {
+    args.push('--worktree', shellQuote(target.worktree))
+  }
+  if (target.windowId !== undefined) {
+    args.push('--window-id', String(target.windowId))
+  } else if (target.windowIndex !== undefined) {
+    args.push('--window-index', String(target.windowIndex))
+  } else {
+    const windowId = result.action?.targetWindowId ?? result.snapshot.window.id
+    if (windowId !== null && windowId !== undefined) {
+      args.push('--window-id', String(windowId))
+    }
+  }
+  if (target.restoreWindow) {
+    args.push('--restore-window')
+  }
+  return args.join(' ')
 }
 
 function formatActionVerification(verification: ComputerActionVerification | undefined): string {

@@ -15,9 +15,31 @@
 
 import { z } from 'zod'
 import { FEATURE_WALL_MAX_DWELL_MS } from './feature-wall-telemetry'
+import { FEATURE_WALL_EXIT_ACTIONS, FEATURE_WALL_TOUR_DEPTH_STEPS } from './feature-wall-tour-depth'
+import {
+  CONTEXTUAL_TOUR_OUTCOMES,
+  FEATURE_EDUCATION_CONTEXTUAL_TOUR_IDS,
+  FEATURE_EDUCATION_SOURCES,
+  SETUP_GUIDE_CLOSE_OUTCOMES,
+  SETUP_GUIDE_SOURCES,
+  TERMINAL_PANE_SPLIT_SOURCES
+} from './feature-education-telemetry'
+import { FEATURE_WALL_SETUP_STEP_IDS } from './feature-wall-setup-steps'
+import { SETUP_SCRIPT_IMPORT_PROVIDERS } from './setup-script-import-providers'
+import { WORKSPACE_SOURCE_VALUES, type WorkspaceSource } from './workspace-source'
+import { appStarSourceSchema } from './gh-star-source'
+import {
+  NESTED_REPO_COUNT_BUCKETS,
+  NESTED_REPO_IMPORT_ACTIONS,
+  NESTED_REPO_IMPORT_OUTCOMES,
+  NESTED_REPO_SCAN_RESULTS,
+  NESTED_REPO_TELEMETRY_MAX_REPO_COUNT,
+  NESTED_REPO_TELEMETRY_RUNTIME_KINDS,
+  NESTED_REPO_TELEMETRY_SURFACES,
+  bucketNestedRepoTelemetryCount
+} from './nested-repo-telemetry'
 
 import { AGENT_HOOK_TARGETS } from './agent-hook-types'
-import { ONBOARDING_FINAL_STEP } from './constants'
 import type {
   DiscoveryStatusEmitted,
   GlobalSettings,
@@ -36,11 +58,14 @@ import type {
 // should map to concrete values; see `tuiAgentToAgentKind`.
 export const AGENT_KIND_VALUES = [
   'claude-code',
+  'openclaude',
   'codex',
   'autohand',
   'opencode',
   'pi',
+  'omp',
   'gemini',
+  'antigravity',
   'aider',
   'goose',
   'amp',
@@ -50,6 +75,7 @@ export const AGENT_KIND_VALUES = [
   'aug',
   'cline',
   'codebuff',
+  'command-code',
   'continue',
   'cursor',
   'droid',
@@ -88,11 +114,11 @@ export type ErrorClass = z.infer<typeof errorClassSchema>
 export const repoMethodSchema = z.enum(['folder_picker', 'clone_url', 'drag_drop'])
 export type RepoMethod = z.infer<typeof repoMethodSchema>
 
-// Five Setup-step affordances the user can pick after `repo_added` fires (see
-// AddRepoSetupStep). One enum because every value lives on the same screen and
-// the funnel question is "which one did they pick" — adding a sixth value
-// later is additive-safe per the schema-evolution doctrine below.
+// Historical setup-step affordances users could pick after `repo_added` fired.
+// Current Add Project flows skip that choice screen and auto-open the default
+// checkout, but the schema stays for pre-rollout rows and compatibility.
 export const addRepoSetupStepActionSchema = z.enum([
+  'open_primary',
   'create_worktree',
   'configure',
   'skip',
@@ -100,6 +126,46 @@ export const addRepoSetupStepActionSchema = z.enum([
   'back'
 ])
 export type AddRepoSetupStepAction = z.infer<typeof addRepoSetupStepActionSchema>
+
+export const addRepoExistingWorkspaceSourceSchema = z.enum([
+  'local_folder_picker',
+  'runtime_server_path',
+  'ssh_remote_path',
+  'clone_url',
+  'create_project'
+])
+export type AddRepoExistingWorkspaceSource = z.infer<typeof addRepoExistingWorkspaceSourceSchema>
+export const addRepoDefaultCheckoutHandoffSourceSchema = z.enum([
+  'local_folder_picker',
+  'runtime_server_path',
+  'ssh_remote_path',
+  'clone_url',
+  'create_project',
+  'onboarding_open_folder',
+  'onboarding_clone_url',
+  'project_added_compat'
+])
+export type AddRepoDefaultCheckoutHandoffSource = z.infer<
+  typeof addRepoDefaultCheckoutHandoffSourceSchema
+>
+export const addRepoDefaultCheckoutHandoffResultSchema = z.enum([
+  'opened_default_checkout',
+  'revealed_project'
+])
+export const addRepoDefaultCheckoutHandoffReasonSchema = z.enum([
+  'loaded_default_checkout',
+  'detected_default_checkout',
+  'no_authoritative_detection',
+  'no_default_checkout',
+  'show_detected_default_failed',
+  'show_detected_linked_failed',
+  'authoritative_refresh_failed',
+  'linked_external_refresh_failed',
+  'refreshed_default_missing'
+])
+
+export const setupScriptImportProviderSchema = z.enum(SETUP_SCRIPT_IMPORT_PROVIDERS)
+export type SetupScriptImportProviderTelemetry = z.infer<typeof setupScriptImportProviderSchema>
 
 // Deliberately a separate enum from `errorClassSchema` (PTY-spawn taxonomy):
 // different domain — this one buckets git/filesystem failures thrown by
@@ -115,19 +181,13 @@ export const workspaceCreateErrorClassSchema = z.enum([
 ])
 export type WorkspaceCreateErrorClass = z.infer<typeof workspaceCreateErrorClassSchema>
 
-export const workspaceSourceSchema = z.enum([
-  'command_palette',
-  'sidebar',
-  'shortcut',
-  'drag_drop',
-  'onboarding',
-  'unknown'
-])
-export type WorkspaceSource = z.infer<typeof workspaceSourceSchema>
+export const workspaceSourceSchema = z.enum(WORKSPACE_SOURCE_VALUES)
+export type { WorkspaceSource }
 
 export const launchSourceSchema = z.enum([
   'command_palette',
   'sidebar',
+  'quick_command',
   'tab_bar_quick_launch',
   'task_page',
   'new_workspace_composer',
@@ -136,6 +196,9 @@ export const launchSourceSchema = z.enum([
   'onboarding',
   'diff_notes_send',
   'notes_send',
+  'conflict_resolution',
+  'source_control_recovery',
+  'terminal_context_menu',
   'unknown'
 ])
 export type LaunchSource = z.infer<typeof launchSourceSchema>
@@ -159,8 +222,23 @@ export const featureWallTileIdSchema = z.enum([
 ])
 export type FeatureWallTileIdTelemetry = z.infer<typeof featureWallTileIdSchema>
 
-export const featureWallOpenSourceSchema = z.enum(['help_menu', 'popup', 'unknown'])
+export const featureWallOpenSourceSchema = z.enum(['help_menu', 'popup', 'onboarding', 'unknown'])
 export type FeatureWallOpenSourceTelemetry = z.infer<typeof featureWallOpenSourceSchema>
+
+export const featureWallWorkflowIdSchema = z.enum([
+  'tasks',
+  'workspaces',
+  'agents-orchestration',
+  'workbench',
+  'review'
+])
+export type FeatureWallWorkflowIdTelemetry = z.infer<typeof featureWallWorkflowIdSchema>
+
+export const featureWallTourDepthStepSchema = z.enum(FEATURE_WALL_TOUR_DEPTH_STEPS)
+export type FeatureWallTourDepthStepTelemetry = z.infer<typeof featureWallTourDepthStepSchema>
+
+export const featureWallExitActionSchema = z.enum(FEATURE_WALL_EXIT_ACTIONS)
+export type FeatureWallExitActionTelemetry = z.infer<typeof featureWallExitActionSchema>
 
 // `env_var` is deliberately absent — env-var and CI paths override consent at
 // runtime only (see consent.ts); they never mutate `optedIn` and therefore
@@ -198,7 +276,9 @@ export const SETTINGS_CHANGED_WHITELIST = [
   'experimentalMobile',
   'experimentalPet',
   'experimentalActivity',
+  'experimentalTerminalAttention',
   'experimentalWorktreeSymlinks',
+  'experimentalUnifiedNewTabLauncher',
   'geminiCliOAuthEnabled'
 ] as const satisfies readonly BooleanGlobalSettingsKey[]
 export const settingsChangedKeySchema = z.enum(SETTINGS_CHANGED_WHITELIST)
@@ -225,6 +305,13 @@ const repoAddedSchema = z
   .object({ method: repoMethodSchema, nth_repo_added: nthRepoAddedSchema })
   .strict()
 
+const appStarredOrcaSchema = z
+  .object({
+    source: appStarSourceSchema,
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+
 const workspaceCreatedSchema = z
   .object({
     source: workspaceSourceSchema,
@@ -234,6 +321,14 @@ const workspaceCreatedSchema = z
   .strict()
 
 const agentStartedSchema = z
+  .object({
+    agent_kind: agentKindSchema,
+    launch_source: launchSourceSchema,
+    request_kind: requestKindSchema,
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+const agentPromptSentSchema = z
   .object({
     agent_kind: agentKindSchema,
     launch_source: launchSourceSchema,
@@ -265,6 +360,27 @@ const settingsChangedSchema = z
 const telemetryOptedInSchema = z.object({ via: optInViaSchema }).strict()
 const telemetryOptedOutSchema = z.object({ via: optInViaSchema }).strict()
 
+const orcaCliFeatureTipSourceSchema = z.enum(['app_open', 'manual'])
+const orcaCliFeatureTipShownSchema = z
+  .object({
+    source: orcaCliFeatureTipSourceSchema,
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+const orcaCliFeatureTipSetupClickedSchema = z
+  .object({
+    source: orcaCliFeatureTipSourceSchema,
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+const orcaCliFeatureTipSetupResultSchema = z
+  .object({
+    source: orcaCliFeatureTipSourceSchema,
+    result: z.enum(['installed', 'needs_attention', 'dev_preview', 'failed']),
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+
 const featureWallOpenedSchema = z
   .object({
     source: featureWallOpenSourceSchema
@@ -272,7 +388,15 @@ const featureWallOpenedSchema = z
   .strict()
 const featureWallClosedSchema = z
   .object({
-    dwell_ms: z.number().int().min(0).max(FEATURE_WALL_MAX_DWELL_MS)
+    dwell_ms: z.number().int().min(0).max(FEATURE_WALL_MAX_DWELL_MS),
+    source: featureWallOpenSourceSchema.optional(),
+    exit_action: featureWallExitActionSchema.optional(),
+    furthest_step: featureWallTourDepthStepSchema.optional(),
+    last_group_id: featureWallWorkflowIdSchema.optional(),
+    visited_workflow_count: z.number().int().min(0).max(5).optional(),
+    visited_substep_count: z.number().int().min(0).max(9).optional(),
+    completed_workflow_count: z.number().int().min(0).max(5).optional(),
+    completed_substep_count: z.number().int().min(0).max(9).optional()
   })
   .strict()
 const featureWallTileFocusedSchema = z
@@ -285,9 +409,61 @@ const featureWallTileClickedSchema = z
     tile_id: featureWallTileIdSchema
   })
   .strict()
+const featureWallGroupSelectedSchema = z
+  .object({
+    group_id: featureWallWorkflowIdSchema,
+    source: featureWallOpenSourceSchema
+  })
+  .strict()
+const featureWallFeatureSelectedSchema = z
+  .object({
+    group_id: featureWallWorkflowIdSchema,
+    tile_id: featureWallTileIdSchema,
+    source: featureWallOpenSourceSchema
+  })
+  .strict()
+const featureWallDocsClickedSchema = z
+  .object({
+    group_id: featureWallWorkflowIdSchema,
+    tile_id: featureWallTileIdSchema,
+    source: featureWallOpenSourceSchema
+  })
+  .strict()
+
+const existingWorkspaceCountSchema = z.number().int().min(1).max(50)
+const addRepoExistingWorkspaceContextSchema = {
+  source: addRepoExistingWorkspaceSourceSchema,
+  existing_workspace_count: existingWorkspaceCountSchema,
+  existing_linked_workspace_count: z.number().int().min(0).max(50)
+} as const
 
 const addRepoSetupStepActionEventSchema = z
-  .object({ action: addRepoSetupStepActionSchema, nth_repo_added: nthRepoAddedSchema })
+  .object({
+    action: addRepoSetupStepActionSchema,
+    source: addRepoExistingWorkspaceSourceSchema.optional(),
+    existing_workspace_count: existingWorkspaceCountSchema.optional(),
+    existing_linked_workspace_count: z.number().int().min(0).max(50).optional(),
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+const addRepoExistingWorkspacesDetectedSchema = z
+  .object({
+    ...addRepoExistingWorkspaceContextSchema,
+    main_workspace_count: z.number().int().min(0).max(50),
+    branch_named_workspace_count: z.number().int().min(0).max(50),
+    detached_workspace_count: z.number().int().min(0).max(50),
+    custom_named_workspace_count: z.number().int().min(0).max(50),
+    sparse_workspace_count: z.number().int().min(0).max(50),
+    nth_repo_added: nthRepoAddedSchema
+  })
+  .strict()
+const addRepoDefaultCheckoutHandoffSchema = z
+  .object({
+    source: addRepoDefaultCheckoutHandoffSourceSchema,
+    result: addRepoDefaultCheckoutHandoffResultSchema,
+    reason: addRepoDefaultCheckoutHandoffReasonSchema,
+    nth_repo_added: nthRepoAddedSchema
+  })
   .strict()
 
 // Why: same enum-only discipline as `agent_error` — `.strict()` rejects raw
@@ -301,6 +477,106 @@ const workspaceCreateFailedSchema = z
     nth_repo_added: nthRepoAddedSchema
   })
   .strict()
+
+const setupScriptPromptModeSchema = z.enum(['import_available', 'configure_needed'])
+const setupScriptCountBucketSchema = z.enum(['0', '1', '2-3', '4+'])
+const setupScriptPromptContextSchema = {
+  mode: setupScriptPromptModeSchema,
+  // Why: cohort injection probes top-level ZodObject shapes; superRefine
+  // keeps that path while still rejecting impossible mode/provider pairs.
+  provider: setupScriptImportProviderSchema.optional(),
+  file_count_bucket: setupScriptCountBucketSchema,
+  unsupported_field_count_bucket: setupScriptCountBucketSchema,
+  has_shared_hooks: z.boolean(),
+  nth_repo_added: nthRepoAddedSchema
+} as const
+
+type SetupScriptPromptContextTelemetry = {
+  mode: z.infer<typeof setupScriptPromptModeSchema>
+  provider?: z.infer<typeof setupScriptImportProviderSchema>
+}
+
+function validateSetupScriptPromptProvider(
+  props: SetupScriptPromptContextTelemetry,
+  ctx: z.RefinementCtx
+): void {
+  if (props.mode === 'import_available' && props.provider === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['provider'],
+      message: 'provider is required when a setup candidate is available'
+    })
+  }
+  if (props.mode === 'configure_needed' && props.provider !== undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['provider'],
+      message: 'provider is only valid when a setup candidate is available'
+    })
+  }
+}
+// Why: setup-candidate telemetry is for a retention cohort, not debugging a
+// user's repo, so it carries only closed enums and count buckets.
+const setupScriptPromptShownSchema = z
+  .object(setupScriptPromptContextSchema)
+  .strict()
+  .superRefine(validateSetupScriptPromptProvider)
+const setupScriptDetectedSaveActions = [
+  'save_detected_setup_clicked',
+  'save_detected_setup_completed',
+  'save_detected_setup_failed'
+] as const
+
+function isSetupScriptDetectedSaveAction(action: unknown): boolean {
+  return setupScriptDetectedSaveActions.includes(action as never)
+}
+
+function validateSetupScriptPromptAction(
+  props: SetupScriptPromptContextTelemetry & {
+    action?: string
+    edited_before_save?: boolean
+  },
+  ctx: z.RefinementCtx
+): void {
+  validateSetupScriptPromptProvider(props, ctx)
+  const isDetectedSave = isSetupScriptDetectedSaveAction(props.action)
+  if (isDetectedSave && props.provider !== 'package-manager') {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['provider'],
+      message: 'detected setup save actions require the package-manager provider'
+    })
+  }
+  if (isDetectedSave && props.edited_before_save === undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['edited_before_save'],
+      message: 'edited_before_save is required for detected setup save actions'
+    })
+  }
+  if (!isDetectedSave && props.edited_before_save !== undefined) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['edited_before_save'],
+      message: 'edited_before_save is only valid for detected setup save actions'
+    })
+  }
+}
+
+const setupScriptPromptActionSchema = z
+  .object({
+    ...setupScriptPromptContextSchema,
+    action: z.enum([
+      'import_completed',
+      'import_failed',
+      'configure_clicked',
+      'dismissed',
+      ...setupScriptDetectedSaveActions
+    ]),
+    edited_before_save: z.boolean().optional()
+  })
+  .strict()
+  .superRefine(validateSetupScriptPromptAction)
 
 // Managed-hook installer per-agent label. Distinct from `AGENT_KIND_VALUES`:
 // hook installation only targets the agents in `AGENT_HOOK_TARGETS` and the
@@ -342,18 +618,42 @@ const agentHookUnattributedSchema = z
 // Closed enums only — no raw paths, repo names, clone URLs, or error
 // strings. The funnel exists to measure activation, not to debug specific
 // user repos.
-// Why: bound is derived from ONBOARDING_FINAL_STEP so adding a wizard step
-// only requires bumping the constant. Zod can't build a literal-union from a
-// numeric constant without runtime gymnastics, so we use a clamped int range.
-const onboardingStepSchema = z.number().int().min(1).max(ONBOARDING_FINAL_STEP)
-const onboardingPathSchema = z.enum(['open_folder', 'clone_url'])
+// Why: active onboarding now has fewer steps, but these event names already
+// carried seven-step payloads. Keep validation backward-compatible for old rows
+// unless a future versioned event replaces the historical schema.
+const ONBOARDING_TELEMETRY_LEGACY_MAX_STEP = 7
+const onboardingStepSchema = z.number().int().min(1).max(ONBOARDING_TELEMETRY_LEGACY_MAX_STEP)
+const onboardingPathSchema = z.enum(['open_folder', 'clone_url', 'add_project_modal'])
 const onboardingFailureReasonSchema = z.enum([
   'invalid_path',
   'clone_failed',
   'cancelled',
   'unknown'
 ])
-const onboardingValueKindSchema = z.enum(['agent', 'theme', 'notifications', 'repo'])
+const onboardingValueKindSchema = z.enum([
+  'agent',
+  'theme',
+  'notifications',
+  'agent_setup',
+  'integrations',
+  'tour',
+  'repo'
+])
+const onboardingTourOutcomeSchema = z.enum(['skipped_intro', 'started_partial', 'completed_inline'])
+const onboardingTaskSourcesGithubStatusSchema = z.enum([
+  'connected',
+  'not_authenticated',
+  'not_installed',
+  'checking',
+  'unknown'
+])
+const onboardingTaskSourcesLinearStatusSchema = z.enum([
+  'connected',
+  'not_connected',
+  'checking',
+  'unknown'
+])
+const onboardingTaskSourcesExitActionSchema = z.enum(['continue', 'skip_to_project_setup'])
 // `dismissed` from `OnboardingChecklistState` is intentionally excluded —
 // it is a UI panel-visibility flag, not an activation event, so it never
 // fires `activation_checklist_item_completed`. Keep this list in sync with
@@ -425,18 +725,118 @@ void _onboardingChecklistItemSyncCheck
 // `'cohort' in schema.shape`, so there is no parallel hand-maintained list.
 const cohortSchema = z.enum(['fresh_install', 'upgrade_backfill']).optional()
 
+const nestedRepoTelemetrySurfaceSchema = z.enum(NESTED_REPO_TELEMETRY_SURFACES)
+const nestedRepoTelemetryRuntimeKindSchema = z.enum(NESTED_REPO_TELEMETRY_RUNTIME_KINDS)
+const nestedRepoCountSchema = z.number().int().min(0).max(NESTED_REPO_TELEMETRY_MAX_REPO_COUNT)
+const nestedRepoCountBucketSchema = z.enum(NESTED_REPO_COUNT_BUCKETS)
+const nestedRepoScanResultSchema = z.enum(NESTED_REPO_SCAN_RESULTS)
+const nestedRepoImportActionSchema = z.enum(NESTED_REPO_IMPORT_ACTIONS)
+const nestedRepoImportOutcomeSchema = z.enum(NESTED_REPO_IMPORT_OUTCOMES)
+const nestedRepoScanPathKindSchema = z.enum(['git_repo', 'non_git_folder'])
+const nestedRepoImportModeSchema = z.enum(['group', 'separate'])
+const nestedRepoAttemptIdSchema = z.string().uuid()
+
+function validateNestedRepoCountBucket(
+  props: Record<string, unknown>,
+  countKey: string,
+  bucketKey: string,
+  ctx: z.RefinementCtx
+): void {
+  const count = props[countKey]
+  const bucket = props[bucketKey]
+  if (typeof count !== 'number' || typeof bucket !== 'string') {
+    return
+  }
+  if (bucketNestedRepoTelemetryCount(count) !== bucket) {
+    ctx.addIssue({
+      code: 'custom',
+      path: [bucketKey],
+      message: `${bucketKey} must match ${countKey}`
+    })
+  }
+}
+
+function validateNestedRepoCountBuckets(
+  props: Record<string, unknown>,
+  ctx: z.RefinementCtx
+): void {
+  validateNestedRepoCountBucket(props, 'found_count', 'found_count_bucket', ctx)
+  validateNestedRepoCountBucket(props, 'selected_count', 'selected_count_bucket', ctx)
+  validateNestedRepoCountBucket(props, 'imported_count', 'imported_count_bucket', ctx)
+  validateNestedRepoCountBucket(props, 'already_known_count', 'already_known_count_bucket', ctx)
+  validateNestedRepoCountBucket(props, 'failed_count', 'failed_count_bucket', ctx)
+}
+
+const nestedRepoTelemetryBaseSchema = {
+  // Why: high-cardinality by design, but random and non-persistent. It lets
+  // dashboards count scan -> action -> result attempts without path-derived IDs.
+  attempt_id: nestedRepoAttemptIdSchema,
+  surface: nestedRepoTelemetrySurfaceSchema,
+  runtime_kind: nestedRepoTelemetryRuntimeKindSchema,
+  nth_repo_added: nthRepoAddedSchema
+} as const
+
+const addRepoNestedScanResultSchema = z
+  .object({
+    ...nestedRepoTelemetryBaseSchema,
+    result: nestedRepoScanResultSchema,
+    selected_path_kind: nestedRepoScanPathKindSchema.optional(),
+    found_count: nestedRepoCountSchema,
+    found_count_bucket: nestedRepoCountBucketSchema,
+    truncated: z.boolean(),
+    timed_out: z.boolean()
+  })
+  .strict()
+  .superRefine(validateNestedRepoCountBuckets)
+
+const addRepoNestedImportActionSchema = z
+  .object({
+    ...nestedRepoTelemetryBaseSchema,
+    action: nestedRepoImportActionSchema,
+    found_count: nestedRepoCountSchema,
+    found_count_bucket: nestedRepoCountBucketSchema,
+    selected_count: nestedRepoCountSchema,
+    selected_count_bucket: nestedRepoCountBucketSchema,
+    all_selected: z.boolean()
+  })
+  .strict()
+  .superRefine(validateNestedRepoCountBuckets)
+
+const addRepoNestedImportResultSchema = z
+  .object({
+    ...nestedRepoTelemetryBaseSchema,
+    mode: nestedRepoImportModeSchema,
+    outcome: nestedRepoImportOutcomeSchema,
+    found_count: nestedRepoCountSchema,
+    found_count_bucket: nestedRepoCountBucketSchema,
+    selected_count: nestedRepoCountSchema,
+    selected_count_bucket: nestedRepoCountBucketSchema,
+    imported_count: nestedRepoCountSchema,
+    imported_count_bucket: nestedRepoCountBucketSchema,
+    already_known_count: nestedRepoCountSchema,
+    already_known_count_bucket: nestedRepoCountBucketSchema,
+    failed_count: nestedRepoCountSchema,
+    failed_count_bucket: nestedRepoCountBucketSchema,
+    all_selected: z.boolean()
+  })
+  .strict()
+  .superRefine(validateNestedRepoCountBuckets)
+
 // `'button' | 'keyboard'` records whether the user advanced via a footer
-// button click or via Cmd/Ctrl+Enter. Skip and dismiss don't have a keyboard
-// path today (the field will only ever be `'button'` for those events) but
-// the uniform shape lets a future keyboard skip arrive without a schema
-// migration.
+// button click, Cmd/Ctrl+Enter, or an equivalent keyboard exit like Escape.
+// The uniform shape lets keyboard skip/dismiss paths arrive without a
+// schema migration.
 const advancedViaSchema = z.enum(['button', 'keyboard']).optional()
 
 const onboardingStartedSchema = z
   .object({ resumed_from_step: onboardingStepSchema.optional(), cohort: cohortSchema })
   .strict()
 const onboardingStepViewedSchema = z
-  .object({ step: onboardingStepSchema, cohort: cohortSchema })
+  .object({
+    step: onboardingStepSchema,
+    value_kind: onboardingValueKindSchema,
+    cohort: cohortSchema
+  })
   .strict()
 const onboardingStepCompletedSchema = z
   .object({
@@ -450,11 +850,62 @@ const onboardingStepCompletedSchema = z
 const onboardingStepSkippedSchema = z
   .object({
     step: onboardingStepSchema,
+    value_kind: onboardingValueKindSchema,
     duration_ms: z.number().int().nonnegative().optional(),
     advanced_via: advancedViaSchema,
     cohort: cohortSchema
   })
   .strict()
+type OnboardingTourOutcomeTelemetry = {
+  outcome: z.infer<typeof onboardingTourOutcomeSchema>
+  tour_dwell_ms?: number
+  furthest_step?: z.infer<typeof featureWallTourDepthStepSchema>
+  visited_workflow_count?: number
+  visited_substep_count?: number
+  completed_workflow_count?: number
+  completed_substep_count?: number
+}
+
+function validateOnboardingTourOutcome(
+  props: OnboardingTourOutcomeTelemetry,
+  ctx: z.RefinementCtx
+): void {
+  if (props.outcome !== 'skipped_intro') {
+    return
+  }
+  for (const key of [
+    'tour_dwell_ms',
+    'furthest_step',
+    'visited_workflow_count',
+    'visited_substep_count',
+    'completed_workflow_count',
+    'completed_substep_count'
+  ] as const) {
+    if (props[key] !== undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [key],
+        message: `${key} is only valid after the inline tour starts`
+      })
+    }
+  }
+}
+
+const onboardingTourOutcomeEventSchema = z
+  .object({
+    outcome: onboardingTourOutcomeSchema,
+    intro_duration_ms: z.number().int().min(0).max(FEATURE_WALL_MAX_DWELL_MS).optional(),
+    tour_dwell_ms: z.number().int().min(0).max(FEATURE_WALL_MAX_DWELL_MS).optional(),
+    furthest_step: featureWallTourDepthStepSchema.optional(),
+    visited_workflow_count: z.number().int().min(0).max(5).optional(),
+    visited_substep_count: z.number().int().min(0).max(9).optional(),
+    completed_workflow_count: z.number().int().min(0).max(5).optional(),
+    completed_substep_count: z.number().int().min(0).max(9).optional(),
+    advanced_via: advancedViaSchema,
+    cohort: cohortSchema
+  })
+  .strict()
+  .superRefine(validateOnboardingTourOutcome)
 const onboardingStep4PathClickedSchema = z
   .object({ path: onboardingPathSchema, cohort: cohortSchema })
   .strict()
@@ -462,6 +913,16 @@ const onboardingStep4PathFailedSchema = z
   .object({
     path: onboardingPathSchema,
     reason: onboardingFailureReasonSchema,
+    cohort: cohortSchema
+  })
+  .strict()
+const onboardingTaskSourcesSnapshotSchema = z
+  .object({
+    github_status: onboardingTaskSourcesGithubStatusSchema,
+    linear_status: onboardingTaskSourcesLinearStatusSchema,
+    exit_action: onboardingTaskSourcesExitActionSchema,
+    duration_ms: z.number().int().nonnegative().optional(),
+    advanced_via: advancedViaSchema,
     cohort: cohortSchema
   })
   .strict()
@@ -662,6 +1123,97 @@ const onboardingFeatureSetupTerminalInteractedSchema = z
   )
   .strict()
 
+const featureEducationSourceSchema = z.enum(FEATURE_EDUCATION_SOURCES)
+const featureEducationContextualTourIdSchema = z.enum(FEATURE_EDUCATION_CONTEXTUAL_TOUR_IDS)
+const setupGuideSourceSchema = z.enum(SETUP_GUIDE_SOURCES)
+const setupGuideCloseOutcomeSchema = z.enum(SETUP_GUIDE_CLOSE_OUTCOMES)
+const setupGuideStepIdSchema = z.enum(FEATURE_WALL_SETUP_STEP_IDS)
+const setupGuideStepIdOrNoneSchema = z.enum([...FEATURE_WALL_SETUP_STEP_IDS, 'none'] as const)
+const terminalPaneSplitSourceSchema = z.enum(TERMINAL_PANE_SPLIT_SOURCES)
+
+const contextualTourShownSchema = z
+  .object({
+    tour_id: featureEducationContextualTourIdSchema,
+    source: featureEducationSourceSchema,
+    was_feature_previously_interacted: z.boolean()
+  })
+  .strict()
+
+const contextualTourOutcomeSchema = z
+  .object({
+    tour_id: featureEducationContextualTourIdSchema,
+    source: featureEducationSourceSchema,
+    outcome: z.enum(CONTEXTUAL_TOUR_OUTCOMES),
+    steps_seen: z.number().int().min(0).max(8),
+    total_steps: z.number().int().min(1).max(8),
+    furthest_step_index: z.number().int().min(1).max(8).optional(),
+    defined_step_count: z.number().int().min(1).max(8).optional()
+  })
+  .refine((payload) => payload.steps_seen <= payload.total_steps, {
+    message: 'steps_seen must be less than or equal to total_steps',
+    path: ['steps_seen']
+  })
+  .refine(
+    (payload) =>
+      payload.furthest_step_index === undefined ||
+      payload.defined_step_count === undefined ||
+      payload.furthest_step_index <= payload.defined_step_count,
+    {
+      message: 'furthest_step_index must be less than or equal to defined_step_count',
+      path: ['furthest_step_index']
+    }
+  )
+  .refine(
+    (payload) =>
+      (payload.furthest_step_index === undefined) === (payload.defined_step_count === undefined),
+    {
+      message: 'furthest_step_index and defined_step_count must be sent together',
+      path: ['defined_step_count']
+    }
+  )
+  .strict()
+
+const setupGuideOpenedSchema = z
+  .object({
+    source: setupGuideSourceSchema,
+    initial_completed_count: z.number().int().min(0).max(8),
+    total_steps: z.literal(8),
+    first_incomplete_step_id: setupGuideStepIdOrNoneSchema
+  })
+  .strict()
+
+const setupGuideClosedSchema = z
+  .object({
+    source: setupGuideSourceSchema,
+    outcome: setupGuideCloseOutcomeSchema,
+    initial_completed_count: z.number().int().min(0).max(8),
+    final_completed_count: z.number().int().min(0).max(8),
+    total_steps: z.literal(8),
+    active_step_id: setupGuideStepIdOrNoneSchema
+  })
+  .refine((payload) => payload.final_completed_count >= payload.initial_completed_count, {
+    message: 'final_completed_count must be greater than or equal to initial_completed_count',
+    path: ['final_completed_count']
+  })
+  .strict()
+
+const setupGuideStepCompletedSchema = z
+  .object({
+    step_id: setupGuideStepIdSchema,
+    section_id: z.enum(['parallel-work', 'setup']),
+    completed_count: z.number().int().min(1).max(8),
+    total_steps: z.literal(8),
+    setup_guide_visible: z.boolean()
+  })
+  .strict()
+
+const terminalPaneSplitSchema = z
+  .object({
+    source: terminalPaneSplitSourceSchema,
+    direction: z.enum(['vertical', 'horizontal'])
+  })
+  .strict()
+
 // ── Event registry: the one record the validator consumes ───────────────
 //
 // The validator does `eventSchemas[name].safeParse(props)`. `EventMap` is
@@ -677,13 +1229,22 @@ const onboardingFeatureSetupTerminalInteractedSchema = z
 // which cannot be unmixed after the fact.
 export const eventSchemas = {
   app_opened: appOpenedSchema,
+  app_starred_orca: appStarredOrcaSchema,
 
   repo_added: repoAddedSchema,
   add_repo_setup_step_action: addRepoSetupStepActionEventSchema,
+  add_repo_existing_workspaces_detected: addRepoExistingWorkspacesDetectedSchema,
+  add_repo_default_checkout_handoff: addRepoDefaultCheckoutHandoffSchema,
+  add_repo_nested_scan_result: addRepoNestedScanResultSchema,
+  add_repo_nested_import_action: addRepoNestedImportActionSchema,
+  add_repo_nested_import_result: addRepoNestedImportResultSchema,
   workspace_created: workspaceCreatedSchema,
   workspace_create_failed: workspaceCreateFailedSchema,
+  setup_script_prompt_shown: setupScriptPromptShownSchema,
+  setup_script_prompt_action: setupScriptPromptActionSchema,
 
   agent_started: agentStartedSchema,
+  agent_prompt_sent: agentPromptSentSchema,
   agent_error: agentErrorSchema,
   agent_hook_install_failed: agentHookInstallFailedSchema,
   agent_hook_unattributed: agentHookUnattributedSchema,
@@ -693,17 +1254,26 @@ export const eventSchemas = {
   telemetry_opted_in: telemetryOptedInSchema,
   telemetry_opted_out: telemetryOptedOutSchema,
 
+  orca_cli_feature_tip_shown: orcaCliFeatureTipShownSchema,
+  orca_cli_feature_tip_setup_clicked: orcaCliFeatureTipSetupClickedSchema,
+  orca_cli_feature_tip_setup_result: orcaCliFeatureTipSetupResultSchema,
+
   feature_wall_opened: featureWallOpenedSchema,
   feature_wall_closed: featureWallClosedSchema,
   feature_wall_tile_focused: featureWallTileFocusedSchema,
   feature_wall_tile_clicked: featureWallTileClickedSchema,
+  feature_wall_group_selected: featureWallGroupSelectedSchema,
+  feature_wall_feature_selected: featureWallFeatureSelectedSchema,
+  feature_wall_docs_clicked: featureWallDocsClickedSchema,
 
   onboarding_started: onboardingStartedSchema,
   onboarding_step_viewed: onboardingStepViewedSchema,
   onboarding_step_completed: onboardingStepCompletedSchema,
   onboarding_step_skipped: onboardingStepSkippedSchema,
+  onboarding_tour_outcome: onboardingTourOutcomeEventSchema,
   onboarding_step4_path_clicked: onboardingStep4PathClickedSchema,
   onboarding_step4_path_failed: onboardingStep4PathFailedSchema,
+  onboarding_task_sources_snapshot: onboardingTaskSourcesSnapshotSchema,
   onboarding_completed: onboardingCompletedSchema,
   onboarding_dismissed: onboardingDismissedSchema,
   onboarding_agent_picked: onboardingAgentPickedSchema,
@@ -715,6 +1285,13 @@ export const eventSchemas = {
   onboarding_feature_setup_terminal_opened: onboardingFeatureSetupTerminalOpenedSchema,
   onboarding_feature_setup_terminal_interacted: onboardingFeatureSetupTerminalInteractedSchema,
   activation_checklist_item_completed: activationChecklistItemCompletedSchema,
+
+  contextual_tour_shown: contextualTourShownSchema,
+  contextual_tour_outcome: contextualTourOutcomeSchema,
+  setup_guide_opened: setupGuideOpenedSchema,
+  setup_guide_closed: setupGuideClosedSchema,
+  setup_guide_step_completed: setupGuideStepCompletedSchema,
+  terminal_pane_split: terminalPaneSplitSchema,
 
   smart_sort_class_distribution: smartSortClassDistributionSchema,
   smart_sort_class_1_promotion: smartSortClass1PromotionSchema,
@@ -758,12 +1335,24 @@ export const COHORT_EXTENDED: readonly EventName[] = Array.from(COHORT_EXTENDED_
 // injection set against silent schema drift.
 type _CohortExtendedRoster =
   | 'app_opened'
+  | 'app_starred_orca'
   | 'repo_added'
   | 'add_repo_setup_step_action'
+  | 'add_repo_existing_workspaces_detected'
+  | 'add_repo_default_checkout_handoff'
+  | 'add_repo_nested_scan_result'
+  | 'add_repo_nested_import_action'
+  | 'add_repo_nested_import_result'
   | 'workspace_created'
   | 'workspace_create_failed'
+  | 'setup_script_prompt_shown'
+  | 'setup_script_prompt_action'
   | 'agent_started'
+  | 'agent_prompt_sent'
   | 'agent_error'
+  | 'orca_cli_feature_tip_shown'
+  | 'orca_cli_feature_tip_setup_clicked'
+  | 'orca_cli_feature_tip_setup_result'
 // Why: `z.object({}).strict()` infers a string index signature, which would
 // make every key appear present. Ignore index-signature-only keys here so
 // strict empty event payloads do not get pulled into keyed telemetry rosters.
@@ -808,8 +1397,10 @@ type _OnboardingCohortRoster =
   | 'onboarding_step_viewed'
   | 'onboarding_step_completed'
   | 'onboarding_step_skipped'
+  | 'onboarding_tour_outcome'
   | 'onboarding_step4_path_clicked'
   | 'onboarding_step4_path_failed'
+  | 'onboarding_task_sources_snapshot'
   | 'onboarding_completed'
   | 'onboarding_dismissed'
   | 'onboarding_agent_picked'
