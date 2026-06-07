@@ -76,6 +76,21 @@ describe('cleanGeneratedCommitMessage', () => {
   it('returns empty string when input is whitespace', () => {
     expect(cleanGeneratedCommitMessage('   \n\t')).toBe('')
   })
+
+  it('strips ANSI escape sequences before processing', () => {
+    const raw = '\x1b[0m\nfeat: hello\x1b[0m'
+    expect(cleanGeneratedCommitMessage(raw)).toBe('feat: hello')
+  })
+
+  it('strips opencode "> agent · model" header line', () => {
+    const raw = '> summary · deepseek-v4-flash-free\nfeat: hello world'
+    expect(cleanGeneratedCommitMessage(raw)).toBe('feat: hello world')
+  })
+
+  it('strips opencode ANSI codes and header together', () => {
+    const raw = '\x1b[0m\n> summary · deepseek-v4-flash-free\n\x1b[0m\nfeat: hello world'
+    expect(cleanGeneratedCommitMessage(raw)).toBe('feat: hello world')
+  })
 })
 
 describe('extractAgentErrorMessage', () => {

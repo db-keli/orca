@@ -13,9 +13,9 @@ import {
 } from './commit-message-agent-spec'
 
 describe('COMMIT_MESSAGE_AGENT_SPECS', () => {
-  it('exposes Claude and Codex as the v1 agents', () => {
+  it('exposes Claude, Codex, and OpenCode as supported agents', () => {
     const ids = listCommitMessageAgentIds().sort()
-    expect(ids).toEqual(['claude', 'codex'])
+    expect(ids).toEqual(['claude', 'codex', 'opencode'])
   })
 
   it('uses the smartest model as the default for each agent', () => {
@@ -81,7 +81,11 @@ describe('COMMIT_MESSAGE_AGENT_SPECS', () => {
 
   it('exposes UI capabilities without spawn details', () => {
     const capabilities = listCommitMessageAgentCapabilities()
-    expect(capabilities.map((capability) => capability.id).sort()).toEqual(['claude', 'codex'])
+    expect(capabilities.map((capability) => capability.id).sort()).toEqual([
+      'claude',
+      'codex',
+      'opencode'
+    ])
     const codex = getCommitMessageAgentCapability('codex')
     expect(codex).toMatchObject({
       id: 'codex',
