@@ -46,6 +46,40 @@ export type CommitMessageAgentCapability = {
 }
 
 export const COMMIT_MESSAGE_AGENT_SPECS: Partial<Record<TuiAgent, CommitMessageAgentSpec>> = {
+  opencode: {
+    id: 'opencode',
+    label: 'OpenCode',
+    binary: 'opencode',
+    // Why: `opencode run` delivers the prompt as a positional argv argument — there
+    // is no stdin-reading mode. ARG_MAX on macOS/Linux is >= 1MB; the staged diff is
+    // capped at 200KB, well within that limit.
+    promptDelivery: 'argv',
+    buildArgs: ({ prompt, model, thinkingLevel }) => [
+      'run',
+      '--model',
+      model,
+      // Why: "summary" is a built-in text-only agent with no file-write permissions,
+      // which matches what commit-message generation needs.
+      '--agent',
+      'summary',
+      '--format',
+      'default',
+      ...(thinkingLevel ? ['--variant', thinkingLevel] : []),
+      prompt
+    ],
+    // Why: only opencode's built-in free models are listed here because they are
+    // universally available regardless of what providers the user has configured.
+    // Users who have additional providers (Anthropic, OpenAI, etc.) can override
+    // via the custom agent command setting.
+    models: [
+      { id: 'opencode/deepseek-v4-flash-free', label: 'DeepSeek V4 Flash (Free)' },
+      { id: 'opencode/big-pickle', label: 'Big Pickle' },
+      { id: 'opencode/mimo-v2.5-free', label: 'Mimo V2.5 (Free)' },
+      { id: 'opencode/minimax-m3-free', label: 'MiniMax M3 (Free)' },
+      { id: 'opencode/nemotron-3-ultra-free', label: 'Nemotron 3 Ultra (Free)' }
+    ],
+    defaultModelId: 'opencode/deepseek-v4-flash-free'
+  },
   claude: {
     id: 'claude',
     label: 'Claude',
@@ -222,7 +256,11 @@ export function resolveCommitMessageAgentChoice(
     return configuredAgentId
   }
   if (defaultTuiAgent && defaultTuiAgent !== 'blank') {
-    return getCommitMessageAgentSpec(defaultTuiAgent) ? defaultTuiAgent : null
+    // Why: agents like opencode have no non-interactive commit-message spec; fall
+    // back to the default rather than disabling the feature entirely for those users.
+    return getCommitMessageAgentSpec(defaultTuiAgent)
+      ? defaultTuiAgent
+      : DEFAULT_COMMIT_MESSAGE_AGENT_ID
   }
   return DEFAULT_COMMIT_MESSAGE_AGENT_ID
 }

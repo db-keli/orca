@@ -44,18 +44,31 @@ export function truncateDiffForPrompt(
 }
 
 /** Strips noise around the agent's output: surrounding whitespace, a single
- *  enclosing fenced code block, and lone "Generating…" preamble lines some
- *  CLIs print before the real answer. */
+ *  enclosing fenced code block, and lone preamble lines some CLIs print before
+ *  the real answer. */
 export function cleanGeneratedCommitMessage(raw: string): string {
-  let text = raw.replace(/\r\n/g, '\n').trim()
+  // Why: some CLIs (opencode) emit ANSI control sequences to stdout even when
+  // writing to a pipe. Strip them before any other processing so they don't
+  // end up in the saved commit message.
+  // eslint-disable-next-line no-control-regex
+  let text = raw
+    .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+    .replace(/\r\n/g, '\n')
+    .trim()
 
-  // Why: real commit messages never start with an ellipsis or the word
-  // "Generating"/"Thinking" — those leak from CLIs that print a status line
-  // before the actual response.
+  // Why: real commit messages never start with these patterns — they leak from
+  // CLIs that print a status/header line before the actual response:
+  //   - "Generating…" / "Thinking…" status lines (various CLIs)
+  //   - "…" placeholder lines
+  //   - "> agent · model" header lines (opencode)
   const firstNewline = text.indexOf('\n')
   if (firstNewline !== -1) {
     const firstLine = text.slice(0, firstNewline)
-    if (/^(generating|thinking)\b/i.test(firstLine) || /^[.…]+$/.test(firstLine.trim())) {
+    if (
+      /^(generating|thinking)\b/i.test(firstLine) ||
+      /^[.…]+$/.test(firstLine.trim()) ||
+      /^>\s+\S/.test(firstLine)
+    ) {
       text = text.slice(firstNewline + 1).trim()
     }
   }
